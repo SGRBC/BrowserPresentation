@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Presentation Viewer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="client">
+  <main class="client-stage">
+    <div class="screen blank" id="screen"><div class="inner"></div></div>
+  </main>
+  <div class="client-notice" id="notice" hidden></div>
+  <div class="client-bar">
+    <span id="status">Not connected</span>
+    <span class="client-actions">
+      <button id="fullscreen" type="button" hidden>Fullscreen</button>
+      <button id="change" type="button">Change code</button>
+    </span>
+  </div>
+  <div class="client-join" id="join" hidden>
+    <form id="join-form" autocomplete="off">
+      <h2>Connect to the presenter</h2>
+      <label>Access code (shown in the presenter's Settings, Online mirror)
+        <input type="text" id="code" maxlength="64" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+      </label>
+      <details>
+        <summary>Relay server</summary>
+        <label>Must match the presenter's setting (HTTPS)
+          <input type="text" id="server" maxlength="200" autocomplete="off" autocapitalize="off" spellcheck="false">
+        </label>
+      </details>
+      <div class="client-error" id="join-error" hidden></div>
+      <button type="submit" class="primary">Connect</button>
+      <button type="button" id="scan">Scan QR code instead</button>
+    </form>
+  </div>
+  <div class="client-join" id="scanner" hidden>
+    <div class="client-scan">
+      <h2>Scan the QR code</h2>
+      <p>Point the camera at the QR code in the presenter's Settings, under Online mirror.</p>
+      <video id="scan-video" muted playsinline></video>
+      <div class="client-error" id="scan-error" hidden></div>
+      <button type="button" id="scan-cancel">Cancel</button>
+    </div>
+  </div>
+  <script type="module" src="client.js"></script>
+</body>
+</html>

@@ -1,0 +1,2604 @@
+import { CHANNEL_NAME, applyTheme, renderSlide, videoCommand, unlockSound } from "./screen.js";
+import { MEDIA_ID_RE, ImportError, putMedia, getMediaBlob, getMediaUrl, deleteMedia, pruneMedia, imageToJpegBlob } from "./media.js";
+import { readPresentation } from "./pptx.js";
+import { renderPdf, MAX_PDF_PAGES } from "./pdfimport.js";
+import { DriveError, extractFolderId, extractFileId, isDriveId, listFolder, fetchAudio, fetchTextFile } from "./drive.js";
+import { loadSettings as loadRelay, saveSettings as saveRelay, generateCode, normalizeServer, isValidCode, createPublisher, viewerLink, qrText } from "./relay.js";
+
+const $ = (id) => document.getElementById(id);
+const STORAGE_KEY = "presentation-settings-v1";
+const SETLIST_KEY = "presentation-setlist-v1";
+const AUDIOSET_KEY = "presentation-audioset-v1";
+const CUSTOM_KEY = "presentation-custom-v1";
+const LOCAL_SONGS_KEY = "presentation-local-songs-v1";
+const LOCAL_AUDIO_KEY = "presentation-local-audio-v1";
+const PRESIDER_KEY = "presentation-presider-mode-v1";
+const ESV_KEY_STORAGE = "presentation-esv-key-v1"; // API key entered by the user; never stored in config.json
+const DRIVE_KEY_STORAGE = "presentation-drive-key-v1"; // Google API key for the Drive folder; never stored in config.json
+const ESV_REF_RE = /^[A-Za-z0-9\s:;,.\-\u2013]+$/;
+const MAX_SETLIST = 500;
+const MAX_CUSTOM = 200;
+const MAX_CUSTOM_TEXT = 20000;
+const MAX_IMAGE_FILE = 15 * 1024 * 1024; // picked file size limit
+const MAX_IMAGE_EDGE = 1600;             // images are downscaled to this on import
+const BG_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
+const MAX_VIDEO_FILE = 2 * 1024 * 1024 * 1024; // 2 GB
+const MAX_DECK_SLIDES = 300;
+const MAX_DECK_TEXT = 5000;
+const SHEET_ID_RE = /^[A-Za-z0-9_-]{10,100}$/;
+const GID_RE = /^\d{1,20}$/;
+
+const channel = new BroadcastChannel(CHANNEL_NAME);
+const previewEl = $("preview");
+
+let config = null;
+let songs = [];
+let song = null;
+let slides = [];
+let index = 0;
+let blank = true;
+let linesPerSlide = 0;
+let customs = [];   // saved custom slides: [{ title, lyrics, author: "", custom: true }]
+let editing = null; // custom slide currently loaded in the editor, if any
+let customBg = "";  // background image (data URL) currently chosen in the editor
+let customMedia = null; // video or PowerPoint chosen in the editor: { video, deck, muted, name }
+let importing = false;  // true while a video/PowerPoint is being stored (blocks cleanup)
+let videoPaused = false; // operator pressed Pause on the current video
+let lastVideoKey = "";
+let live = true;      // true: the output window shows the current slide; false: the output window stays blank
+let lastSent = null;  // last message sent to the output window
+let esvKey = "";
+let songSource = "sheet";   // "sheet" | "local"
+let audioSource = "local";  // "local" | "drive"
+let autoPlayAudio = false;  // play the song's matching audio when its first verse goes live
+let presiderMode = false;   // hides preview & open-output controls for presiding
+let driveFolderId = ""; // root Google Drive folder
+let driveFolderUrl = ""; // the folder URL exactly as entered in Settings
+let driveFolderBad = false; // the folder box holds something that is not a Drive folder link
+let driveKey = "";
+let drivePath = [];     // folders entered below the root: [{ id, name }]
+let driveItems = [];    // current folder listing: [{ id, name, kind }]
+let driveLoaded = "";   // "folder|key" the listing was last loaded for
+let driveToken = 0;     // newest listing request; older answers are ignored
+let localAudioTracks = []; // [{ id, name, path, size }] stored locally
+let localAudioPath = [];   // current folder navigation in local audio: string[]
+let playToken = 0;      // newest play request; older downloads are ignored
+let playingId = "";     // file id loaded into the audio player
+let playingIsLocal = false;
+let audioSet = [];      // audio set list: [{ id, name, local }] in play order
+let audioIndex = -1;    // position in audioSet of the track in the player, -1 if none
+let audioUrl = "";      // blob: / object URL of that file
+let esvPending = null; // last fetched ESV passage, not yet saved: same shape as a custom slide
+let setlist = [];   // [{ title, author, custom }] references into the song library
+let setIndex = -1;  // position in setlist of the song being shown, -1 if none
+let dragType = "";  // "setlist" | "audioset"
+let dragSourceIndex = -1;
+let dragJustEnded = false;
+
+// ---------- Config & settings ----------
+async function fetchJson(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to load ${url}`);
+  return res.json();
+}
+
+function loadSaved() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
+  catch { return {}; }
+}
+
+function extractSheetId(value) {
+  const v = value.trim();
+  const m = v.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/);
+  return m ? m[1] : v;
+}
+
+function currentTheme() { return config.theme; }
+
+// ---------- Song & Audio parsers / local management ----------
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (c === '"') {
+        if (next === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',' || c === '\t') { row.push(field); field = ""; }
+      else if (c === '\r') {
+        if (next === '\n') i++;
+        row.push(field); field = ""; rows.push(row); row = [];
+      } else if (c === '\n') {
+        row.push(field); field = ""; rows.push(row); row = [];
+      } else {
+        field += c;
+      }
+    }
+  }
+  if (field || row.length) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((cell) => cell.trim()));
+}
+
+function parseSongsCsv(text) {
+  const cleanText = text.replace(/^\uFEFF/, "");
+  const rows = parseCsvRows(cleanText);
+  if (!rows.length) return [];
+  const header = rows[0].map((h) => h.trim().toLowerCase().replace(/^["']|["']$/g, ""));
+  let iTitle = header.findIndex((h) => h === "title" || h === "song" || h === "song title" || h === "name");
+  let iLyrics = header.findIndex((h) => h === "lyrics" || h === "text" || h === "words" || h === "body");
+  let iAuthor = header.findIndex((h) => h === "author" || h === "artist" || h === "composer" || h === "by");
+  if (iTitle < 0 || iLyrics < 0) {
+    throw new Error('CSV must have "title" and "lyrics" headers in the first row');
+  }
+  return rows.slice(1).map((row) => ({
+    title: String(row[iTitle] || "").trim(),
+    lyrics: String(row[iLyrics] || "").trim(),
+    author: iAuthor >= 0 ? String(row[iAuthor] || "").trim() : "",
+  })).filter((s) => s.title && s.lyrics);
+}
+
+function parseSongsJson(text) {
+  const cleanText = text.replace(/^\uFEFF/, "");
+  const data = JSON.parse(cleanText);
+  const arr = Array.isArray(data) ? data : Array.isArray(data.songs) ? data.songs : [];
+  return arr.map((s) => ({
+    title: String(s.title || s.name || s.song || "").trim(),
+    lyrics: String(s.lyrics || s.text || s.words || s.body || "").trim(),
+    author: String(s.author || s.artist || "").trim(),
+  })).filter((s) => s.title && s.lyrics);
+}
+
+function loadSavedLocalSongs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCAL_SONGS_KEY));
+    if (raw && Array.isArray(raw.songs)) return raw.songs;
+    if (Array.isArray(raw)) return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function renderLocalSongsInfo() {
+  const info = $("local-songs-info");
+  if (!info) return;
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCAL_SONGS_KEY));
+    if (raw && raw.songs && raw.songs.length) {
+      info.textContent = `Loaded ${raw.songs.length} songs from ${raw.name || "custom file"}`;
+      return;
+    }
+  } catch {}
+  info.textContent = `Using default ${config.fallbackSongsFile || "songs.json"}`;
+}
+
+async function importLocalSongsFile(file) {
+  if (!file) return;
+  setStatus(`Importing songs from ${file.name}â€¦`);
+  try {
+    const text = await file.text();
+    let imported = [];
+    if (file.name.toLowerCase().endsWith(".json") || text.trim().startsWith("{") || text.trim().startsWith("[")) {
+      imported = parseSongsJson(text);
+    } else {
+      imported = parseSongsCsv(text);
+    }
+    if (!imported.length) throw new Error("No valid songs found in file (need title and lyrics)");
+    localStorage.setItem(LOCAL_SONGS_KEY, JSON.stringify({ name: file.name, songs: imported }));
+    songSource = "local";
+    $("song-source").value = "local";
+    updateSourceVisibility();
+    renderLocalSongsInfo();
+    await loadSongs();
+    setStatus(`Imported ${imported.length} songs from ${file.name}`);
+  } catch (err) {
+    console.error(err);
+    setStatus(`Failed to import songs: ${err.message}`);
+  } finally {
+    $("local-songs-file").value = "";
+  }
+}
+
+async function resetDefaultSongs() {
+  localStorage.removeItem(LOCAL_SONGS_KEY);
+  renderLocalSongsInfo();
+  await loadSongs();
+  setStatus("Restored default songs.json");
+}
+
+function loadLocalAudioList() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LOCAL_AUDIO_KEY));
+    localAudioTracks = Array.isArray(raw)
+      ? raw.filter((x) => x && typeof x.id === "string" && MEDIA_ID_RE.test(x.id) && typeof x.name === "string")
+      : [];
+  } catch {
+    localAudioTracks = [];
+  }
+}
+
+function saveLocalAudioList() {
+  localStorage.setItem(LOCAL_AUDIO_KEY, JSON.stringify(localAudioTracks));
+}
+
+function renderLocalAudioInfo() {
+  const info = $("local-audio-info");
+  const clearBtn = $("clear-local-audio");
+  if (!info) return;
+  const count = localAudioTracks.length;
+  if (!count) {
+    info.textContent = "No local audio files loaded.";
+    if (clearBtn) clearBtn.hidden = true;
+  } else {
+    const totalMb = (localAudioTracks.reduce((acc, t) => acc + (t.size || 0), 0) / (1024 * 1024)).toFixed(1);
+    info.textContent = `${count} track${count === 1 ? "" : "s"} loaded (${totalMb} MB). Stored locally in this browser.`;
+    if (clearBtn) clearBtn.hidden = false;
+  }
+}
+
+async function importLocalAudioFiles(fileList) {
+  if (!fileList || !fileList.length) return;
+  const files = Array.from(fileList).filter((f) =>
+    f.type.startsWith("audio/") || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(f.name)
+  );
+  if (!files.length) { setStatus("No audio files (MP3, WAV, OGG, M4A, FLAC) found in selection"); return; }
+
+  setStatus(`Adding ${files.length} audio file${files.length === 1 ? "" : "s"} to local libraryâ€¦`);
+  let added = 0;
+  for (const f of files) {
+    try {
+      const id = await putMedia(f);
+      const relPath = f.webkitRelativePath || f.name;
+      localAudioTracks.push({
+        id,
+        name: f.name,
+        path: relPath,
+        size: f.size,
+      });
+      added++;
+    } catch (err) {
+      console.error(`Failed to store audio file ${f.name}:`, err);
+    }
+  }
+  saveLocalAudioList();
+  renderLocalAudioInfo();
+  renderAudioBrowser();
+  setStatus(`Added ${added} audio track${added === 1 ? "" : "s"} to local library`);
+}
+
+async function clearLocalAudio() {
+  if (!confirm("Remove all local audio tracks from the library?")) return;
+  for (const track of localAudioTracks) {
+    await deleteMedia(track.id).catch(() => {});
+  }
+  localAudioTracks = [];
+  localAudioPath = [];
+  saveLocalAudioList();
+  renderLocalAudioInfo();
+  renderAudioBrowser();
+  setStatus("Cleared local audio library");
+}
+
+function updateSourceVisibility() {
+  const songSrc = $("song-source") ? $("song-source").value : "sheet";
+  const audioSrc = $("audio-source") ? $("audio-source").value : "local";
+  if ($("sheet-song-settings")) $("sheet-song-settings").hidden = songSrc !== "sheet";
+  if ($("local-song-settings")) $("local-song-settings").hidden = songSrc !== "local";
+  if ($("local-audio-settings")) $("local-audio-settings").hidden = audioSrc !== "local";
+  if ($("drive-audio-settings")) $("drive-audio-settings").hidden = audioSrc !== "drive";
+}
+
+function fillSettingsForm() {
+  if ($("song-source")) $("song-source").value = songSource;
+  if ($("audio-source")) $("audio-source").value = audioSource;
+  $("auto-play-audio").checked = autoPlayAudio;
+  updateSourceVisibility();
+  renderLocalSongsInfo();
+  renderLocalAudioInfo();
+  $("sheet-id").value = config.sheet.url || config.sheet.id;
+  $("sheet-gid").value = config.sheet.gid;
+  $("lines").value = linesPerSlide;
+  $("bg").value = config.theme.background;
+  $("fg").value = config.theme.color;
+  $("size").value = config.theme.fontSize;
+  $("auto-fit").checked = Boolean(config.theme.autoFit);
+  $("align").value = config.theme.align;
+  $("uppercase").checked = config.theme.uppercase;
+  $("show-title").checked = config.theme.showTitle;
+  $("esv-key").value = esvKey;
+  renderThemeBgInfo();
+  renderBlankImageInfo();
+  $("drive-folder").value = driveFolderUrl || (driveFolderId ? `https://drive.google.com/drive/folders/${driveFolderId}` : "");
+  $("drive-key").value = driveKey;
+}
+
+function readSettingsForm() {
+  if ($("song-source")) songSource = $("song-source").value;
+  if ($("audio-source")) audioSource = $("audio-source").value;
+  autoPlayAudio = $("auto-play-audio").checked;
+  config.sheet.url = $("sheet-id").value.trim(); // the whole URL as entered, so it is shown again as it was typed
+  config.sheet.id = extractSheetId(config.sheet.url);
+  config.sheet.gid = $("sheet-gid").value.trim() || "0";
+  linesPerSlide = Math.max(0, Math.min(20, parseInt($("lines").value, 10) || 0));
+  const t = config.theme;
+  t.background = $("bg").value;
+  t.color = $("fg").value;
+  t.fontSize = Math.max(2, Math.min(20, parseFloat($("size").value) || 7));
+  t.autoFit = $("auto-fit").checked;
+  t.align = ["left", "center", "right"].includes($("align").value) ? $("align").value : "center";
+  t.uppercase = $("uppercase").checked;
+  t.showTitle = $("show-title").checked;
+  if ($("theme-bg-dim")) t.backgroundDim = Math.max(0, Math.min(80, parseInt($("theme-bg-dim").value, 10) || 0));
+  esvKey = $("esv-key").value.trim();
+  const folderText = $("drive-folder").value.trim();
+  driveFolderUrl = folderText;
+  driveFolderId = extractFolderId(folderText);
+  driveFolderBad = Boolean(folderText) && !driveFolderId;
+  driveKey = $("drive-key").value.trim();
+}
+
+function persist() {
+  if (esvKey) localStorage.setItem(ESV_KEY_STORAGE, esvKey);
+  else localStorage.removeItem(ESV_KEY_STORAGE);
+  if (driveKey) localStorage.setItem(DRIVE_KEY_STORAGE, driveKey);
+  else localStorage.removeItem(DRIVE_KEY_STORAGE);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    sheet: { id: config.sheet.id, url: config.sheet.url || "", gid: config.sheet.gid },
+    drive: { folder: driveFolderId, url: driveFolderUrl },
+    theme: config.theme,
+    linesPerSlide,
+    songSource,
+    audioSource,
+    autoPlayAudio,
+  }));
+}
+
+// ---------- Google Sheet loading ----------
+// Uses the Google Visualization endpoint, which returns JSON wrapped in a JS callback.
+async function loadFromSheet() {
+  const { id, gid, titleColumn, lyricsColumn, authorColumn, timeoutMs } = config.sheet;
+  if (!SHEET_ID_RE.test(id)) throw new Error("Invalid sheet ID");
+  if (!GID_RE.test(gid)) throw new Error("Invalid gid");
+
+  const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(id)}/gviz/tq` +
+    `?tqx=out:json&headers=1&gid=${encodeURIComponent(gid)}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 10000);
+  let text;
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`Sheet request failed (${res.status})`);
+    text = await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("Unexpected sheet response");
+  const data = JSON.parse(text.slice(start, end + 1));
+  if (data.status === "error") throw new Error("Sheet returned an error");
+
+  const cols = data.table.cols.map((c) => (c.label || "").trim().toLowerCase());
+  const iTitle = cols.indexOf(titleColumn.toLowerCase());
+  const iLyrics = cols.indexOf(lyricsColumn.toLowerCase());
+  const iAuthor = cols.indexOf(authorColumn.toLowerCase());
+  if (iTitle < 0 || iLyrics < 0) {
+    throw new Error(`Columns "${titleColumn}" and "${lyricsColumn}" not found in first row`);
+  }
+
+  const cell = (row, i) => (i >= 0 && row.c[i] && row.c[i].v != null ? String(row.c[i].v) : "");
+  return data.table.rows
+    .map((row) => ({
+      title: cell(row, iTitle).trim(),
+      lyrics: cell(row, iLyrics),
+      author: cell(row, iAuthor).trim(),
+    }))
+    .filter((s) => s.title && s.lyrics.trim());
+}
+
+async function loadSongs() {
+  setStatus("Loading songsâ€¦");
+  try {
+    if (songSource === "local") {
+      const local = loadSavedLocalSongs();
+      if (local && local.length) {
+        songs = local;
+        setStatus(`${songs.length} songs from local library`);
+      } else {
+        songs = (await fetchJson(config.fallbackSongsFile)).songs;
+        setStatus(`${songs.length} songs from ${config.fallbackSongsFile} (local default)`);
+      }
+    } else if (config.sheet.id) {
+      songs = await loadFromSheet();
+      setStatus(`${songs.length} songs from Google Sheet`);
+    } else {
+      const local = loadSavedLocalSongs();
+      if (local && local.length) {
+        songs = local;
+        setStatus(`${songs.length} songs from local library`);
+      } else {
+        songs = (await fetchJson(config.fallbackSongsFile)).songs;
+        setStatus(`${songs.length} songs from ${config.fallbackSongsFile} (no sheet set)`);
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    try {
+      const local = loadSavedLocalSongs();
+      if (local && local.length) {
+        songs = local;
+        setStatus(`Sheet unavailable; using local library (${err.message})`);
+      } else {
+        songs = (await fetchJson(config.fallbackSongsFile)).songs;
+        setStatus(`Sheet unavailable; using ${config.fallbackSongsFile} (${err.message})`);
+      }
+    } catch (err2) {
+      console.error(err2);
+      songs = [];
+      setStatus("Could not load any songs");
+    }
+  }
+  renderSongList();
+  renderSetlist();
+}
+
+function setStatus(msg) { $("status").textContent = msg; }
+
+// ---------- Slides ----------
+// Section labels such as "Verse 1", "[Chorus]", "(Bridge)", "Refrain:" or "Chorus x2" are shown to the operator
+// (slide list and preview) but removed from what the output window displays.
+const SECTION_WORD = "(?:pre[- ]?chorus|post[- ]?chorus|chorus|verse|refrain|bridge|intro|outro|tag|coda|interlude|instrumental|ending|vamp|turnaround|hook)";
+const SECTION_LINE_RE = new RegExp(`^[\\[({<]?\\s*${SECTION_WORD}(?:\\s*\\d+|\\s+[a-z])?\\s*(?:\\(?\\s*(?:x\\s*\\d+|\\d+\\s*x)\\s*\\)?)?\\s*[\\])}>]?\\s*:?$`, "i");
+const SECTION_PREFIX_RE = new RegExp(`^[\\[({<]?\\s*${SECTION_WORD}(?:\\s*\\d+|\\s+[a-z])?\\s*[\\])}>]?\\s*:\\s+(?=\\S)`, "i");
+
+// Removes label-only lines, and a "Chorus: " prefix in front of a lyric line.
+function stripSectionLabels(block) {
+  return block.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => !SECTION_LINE_RE.test(line))
+    .map((line) => line.replace(SECTION_PREFIX_RE, ""))
+    .join("\n")
+    .trim();
+}
+
+// Returns slide objects: { text, isTitle }. A title slide comes first when enabled.
+function buildSlides(s) {
+  if (s.video) return [{ text: s.lyrics.trim(), isTitle: false, video: s.video, muted: Boolean(s.muted) }];
+  if (s.deck && s.deck.length) return s.deck.map((d) => ({ text: d.text, isTitle: false, image: d.image }));
+
+  const blocks = s.lyrics.replace(/\r\n?/g, "\n").split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+  const out = [];
+  if (config.theme.showTitle && !s.custom) out.push({ text: s.title, isTitle: true });
+  if (!blocks.length && s.bg) out.push({ text: "", isTitle: false }); // image-only slide
+  for (const block of blocks) {
+    if (!linesPerSlide) { out.push({ text: block, isTitle: false }); continue; }
+    const lines = block.split("\n");
+    for (let i = 0; i < lines.length; i += linesPerSlide) {
+      out.push({ text: lines.slice(i, i + linesPerSlide).join("\n"), isTitle: false });
+    }
+  }
+  return out;
+}
+
+// Rebuild slides for the current song after a settings change, keeping the same lyric slide if possible.
+function rebuildSlides(hadTitle) {
+  if (!song) return;
+  const lyricPos = Math.max(0, index - (hadTitle && !song.custom ? 1 : 0));
+  slides = buildSlides(song);
+  index = Math.min(slides.length - 1, lyricPos + (config.theme.showTitle && !song.custom ? 1 : 0));
+  index = Math.max(0, index);
+  renderSlideList();
+}
+
+// ---------- Set list ----------
+function loadSetlist() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETLIST_KEY));
+    setlist = sanitizeSetlist(raw);
+  } catch {
+    setlist = [];
+  }
+}
+
+function sanitizeSetlist(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((x) => x && typeof x.title === "string")
+    .slice(0, MAX_SETLIST)
+    .map((x) => ({
+      title: x.title.slice(0, 300),
+      author: typeof x.author === "string" ? x.author.slice(0, 300) : "",
+      custom: x.custom === true,
+    }));
+}
+
+function saveSetlist() {
+  localStorage.setItem(SETLIST_KEY, JSON.stringify(setlist));
+}
+
+function library() { return [...customs, ...songs]; }
+
+function findSong(ref) {
+  return library().find((s) =>
+    Boolean(s.custom) === ref.custom && s.title === ref.title && (s.author || "") === ref.author) || null;
+}
+
+function addToSetlist(s) {
+  if (setlist.length >= MAX_SETLIST) return;
+  setlist.push({ title: s.title, author: s.author || "", custom: Boolean(s.custom) });
+  saveSetlist();
+  renderSetlist();
+}
+
+function removeFromSetlist(i) {
+  setlist.splice(i, 1);
+  if (setIndex === i) setIndex = -1;
+  else if (setIndex > i) setIndex -= 1;
+  saveSetlist();
+  renderSetlist();
+}
+
+function reorderSetlist(from, to) {
+  const [item] = setlist.splice(from, 1);
+  setlist.splice(to, 0, item);
+  if (setIndex === from) setIndex = to;
+  else if (from < setIndex && to >= setIndex) setIndex -= 1;
+  else if (from > setIndex && to <= setIndex) setIndex += 1;
+  saveSetlist();
+  renderSetlist();
+}
+
+function makeDraggable(li, type, i, getLength, onReorder) {
+  li.draggable = true;
+  li.addEventListener("dragstart", (e) => {
+    if (e.target.closest("button")) { e.preventDefault(); return; }
+    dragType = type;
+    dragSourceIndex = i;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", String(i));
+    requestAnimationFrame(() => li.classList.add("dragging"));
+  });
+  li.addEventListener("dragover", (e) => {
+    if (dragType !== type) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const rect = li.getBoundingClientRect();
+    const isAfter = e.clientY > rect.top + rect.height / 2;
+    li.classList.toggle("drag-over-above", !isAfter);
+    li.classList.toggle("drag-over-below", isAfter);
+  });
+  li.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget && li.contains(e.relatedTarget)) return;
+    li.classList.remove("drag-over-above", "drag-over-below");
+  });
+  li.addEventListener("dragend", () => {
+    li.classList.remove("dragging", "drag-over-above", "drag-over-below");
+    dragType = "";
+    dragSourceIndex = -1;
+    dragJustEnded = true;
+    setTimeout(() => { dragJustEnded = false; }, 50);
+  });
+  li.addEventListener("drop", (e) => {
+    if (dragType !== type) return;
+    e.preventDefault();
+    const from = dragSourceIndex;
+    const rect = li.getBoundingClientRect();
+    const isAfter = e.clientY > rect.top + rect.height / 2;
+    li.classList.remove("drag-over-above", "drag-over-below");
+    let to = i;
+    if (isAfter && from > to) to = to + 1;
+    else if (!isAfter && from < to) to = to - 1;
+    const len = getLength();
+    if (from === to || from < 0 || to < 0 || from >= len || to >= len) return;
+    onReorder(from, to);
+  });
+}
+
+function playSetlistItem(i, lastSlide = false) {
+  const s = findSong(setlist[i]);
+  if (!s) return false;
+  selectSong(s, i);
+  if (lastSlide) { index = Math.max(0, slides.length - 1); renderSlideList(); publish(); }
+  return true;
+}
+
+// Move to the next/previous playable song in the set list.
+function goSong(delta, lastSlide = false) {
+  if (!setlist.length) return;
+  let i = setIndex < 0 ? (delta > 0 ? -1 : setlist.length) : setIndex;
+  for (i += delta; i >= 0 && i < setlist.length; i += delta) {
+    if (playSetlistItem(i, lastSlide)) return;
+  }
+}
+
+function renderSetlist() {
+  const list = $("setlist");
+  list.replaceChildren();
+  $("set-count").textContent = setlist.length ? `(${setlist.length})` : "";
+  if (!setlist.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Empty. Press + on a song to add it.";
+    list.append(li);
+    return;
+  }
+  setlist.forEach((ref, i) => {
+    const li = document.createElement("li");
+    const found = findSong(ref);
+    if (!found) li.classList.add("missing");
+    if (i === setIndex) li.classList.add("active");
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = found ? ref.title : `${ref.title} (not found)`;
+    li.append(name);
+
+    const mk = (label, title, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+    li.append(mk("\u00D7", "Remove from set list", () => removeFromSetlist(i)));
+    makeDraggable(li, "setlist", i, () => setlist.length, reorderSetlist);
+    li.addEventListener("click", () => { if (!dragJustEnded) playSetlistItem(i); });
+    list.append(li);
+  });
+}
+
+// Local date and time safe for file names, e.g. 2026-11-09_16-30-05.
+function fileStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
+
+const MAX_SETLIST_FILE = 500 * 1024 * 1024; // exported custom slides embed their pictures/videos
+const MEDIA_DATA_RE = /^data:(image\/(jpeg|png|webp|gif)|video\/(mp4|webm|ogg|quicktime));base64,[A-Za-z0-9+/=]+$/;
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+// Stored media id -> self-contained data URL ("" if the media is missing).
+async function mediaToDataUrl(id) {
+  if (!id) return "";
+  const blob = await getMediaBlob(id);
+  return blob ? blobToDataUrl(blob) : "";
+}
+
+// Data URL -> new stored media id ("" if absent or not an allowed picture/video). New ids are pushed to `created`.
+async function dataUrlToMedia(dataUrl, created) {
+  if (typeof dataUrl !== "string" || !MEDIA_DATA_RE.test(dataUrl)) return "";
+  const id = await putMedia(await (await fetch(dataUrl)).blob());
+  created.push(id);
+  return id;
+}
+
+// Copy of a custom slide whose media is embedded instead of referenced by local id.
+async function customForExport(c) {
+  const out = { ...c, video: "", deck: [] };
+  if (c.video) out.videoData = await mediaToDataUrl(c.video);
+  for (const d of c.deck || []) out.deck.push({ text: d.text, imageData: await mediaToDataUrl(d.image) });
+  return out;
+}
+
+async function exportSetlist() {
+  try {
+    setStatus("Preparing set listâ€¦");
+    const titles = [...new Set(setlist.filter((x) => x.custom).map((x) => x.title))];
+    const exported = [];
+    for (const title of titles) {
+      const c = customs.find((x) => x.title === title);
+      if (c) exported.push(await customForExport(c));
+    }
+    const blob = new Blob([JSON.stringify({ setlist, customs: exported }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `setlist_${fileStamp()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`Exported set list${exported.length ? ` with ${exported.length} custom slide${exported.length !== 1 ? "s" : ""}` : ""}`);
+  } catch (err) {
+    console.error(err);
+    setStatus("Could not export set list");
+  }
+}
+
+// Adds imported custom slides to the library; a slide with an existing title replaces that slide's contents.
+async function importCustoms(rawList) {
+  if (!Array.isArray(rawList) || !rawList.length) return 0;
+  const before = customs.slice();
+  const created = [];
+  let count = 0;
+  importing = true; // blocks media cleanup until the slides are saved
+  try {
+    for (const raw of rawList.slice(0, MAX_CUSTOM)) {
+      if (!raw || typeof raw.title !== "string") continue;
+      const video = await dataUrlToMedia(raw.videoData, created);
+      const deck = [];
+      for (const d of (Array.isArray(raw.deck) ? raw.deck : []).slice(0, MAX_DECK_SLIDES)) {
+        if (d && typeof d.text === "string") deck.push({ text: d.text, image: await dataUrlToMedia(d.imageData, created) });
+      }
+      const s = sanitizeCustom({ ...raw, video, deck });
+      if (!s) continue;
+      const i = customs.findIndex((c) => c.title === s.title);
+      if (i >= 0) customs[i] = s;
+      else if (customs.length < MAX_CUSTOM) customs.unshift(s);
+      else continue;
+      count += 1;
+    }
+    if (!saveCustoms()) throw new Error("storage full");
+    renderSongList();
+    return count;
+  } catch (err) {
+    customs = before;
+    for (const id of created) await deleteMedia(id).catch(() => {});
+    throw err;
+  } finally {
+    importing = false;
+    cleanupMedia();
+  }
+}
+
+async function importSetlist(file) {
+  if (!file || file.size > MAX_SETLIST_FILE) { setStatus("Set list file is invalid or too large"); return; }
+  try {
+    const data = JSON.parse(await file.text());
+    const items = sanitizeSetlist(Array.isArray(data) ? data : data.setlist);
+    if (!items.length) throw new Error("empty");
+    const customCount = Array.isArray(data) ? 0 : await importCustoms(data.customs);
+    setlist = items;
+    setIndex = -1;
+    saveSetlist();
+    renderSetlist();
+    // The audio set list is not part of a set list file: any "audioSet" in an older file is ignored, and the
+    // current audio set list is left as it is.
+    const customMsg = customCount ? `, ${customCount} custom slide${customCount !== 1 ? "s" : ""} saved to the library` : "";
+    setStatus(`Imported ${items.length} song${items.length !== 1 ? "s" : ""}${customMsg} into the set list`);
+  } catch {
+    setStatus("Could not read set list file");
+  }
+}
+
+function selectSong(s, setPos = -1) {
+  song = s;
+  setIndex = setPos;
+  slides = buildSlides(s);
+  index = 0;
+  blank = false;
+  $("current-title").textContent = s.author ? `${s.title} â€” ${s.author}` : s.title;
+  renderSongList();
+  renderSetlist();
+  renderSlideList();
+  publish();
+  maybeAutoPlayAudio();
+}
+
+// If enabled, plays the audio track that matches the song title when its first verse (not the title slide) is
+// shown on the output while Live is on. Looks in the audio set list first, then the active audio library.
+function maybeAutoPlayAudio() {
+  if (presiderMode || !autoPlayAudio || !live || blank || !song || song.custom) return;
+  const slide = slides[index];
+  if (!slide || slide.isTitle || slide.video || slide.image) return;
+  const firstVerse = slides.findIndex((x) => !x.isTitle);
+  if (index !== firstVerse) return;
+  const norm = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const want = norm(song.title);
+  if (!want) return;
+  // Exact match wins; otherwise one name may contain the other (e.g. "01 Amazing Grace" or "Amazing Grace (Live)").
+  const score = (name) => {
+    const n = norm(trackTitle(name));
+    if (!n) return 0;
+    if (n === want) return 3;
+    if (n.length >= 4 && want.length >= 4 && (n.includes(want) || want.includes(n))) return 2;
+    return 0;
+  };
+  const best = (list) => {
+    let top = null, topScore = 0;
+    for (const t of list) { const sc = score(t.name); if (sc > topScore) { top = t; topScore = sc; } }
+    return top;
+  };
+  const inSet = best(audioSet);
+  let i = inSet ? audioSet.indexOf(inSet) : -1;
+  if (i < 0) {
+    const pool = audioSource === "local"
+      ? localAudioTracks.map((t) => ({ id: t.id, name: t.name, local: true }))
+      : driveItems.filter((it) => it.kind !== "folder");
+    const found = best(pool);
+    if (!found) { setStatus(`Auto-play: no audio track matches "${song.title}"`); return; }
+    if (audioSet.length >= MAX_SETLIST) return;
+    addToAudioSet(found);
+    i = audioSet.length - 1;
+  }
+  playAudioAt(i);
+}
+
+function go(delta) {
+  if (!song) return;
+  const next = index + delta;
+  if (next >= slides.length) { if (setIndex >= 0) goSong(1); return; }
+  if (next < 0) { if (setIndex >= 0) goSong(-1, true); return; }
+  index = next;
+  blank = false;
+  renderSlideList();
+  publish();
+  maybeAutoPlayAudio();
+}
+
+function toggleBlank() {
+  blank = !blank;
+  $("blank").classList.toggle("active", blank);
+  publish();
+}
+
+// ---------- Rendering (operator) ----------
+function renderSongList() {
+  const q = $("search").value.trim().toLowerCase();
+  const list = $("songs");
+  list.replaceChildren();
+  const shown = library().filter((s) =>
+    !q || `${s.title} ${s.author || ""} ${s.lyrics}`.toLowerCase().includes(q));
+  if (!shown.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "No songs";
+    list.append(li);
+    return;
+  }
+  for (const s of shown) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = s.title;
+    if (s.author || s.custom) {
+      const a = document.createElement("span");
+      a.className = "author";
+      a.textContent = s.custom ? customLabel(s) : s.author;
+      name.append(a);
+    }
+    const mk = (cls, label, title, fn) => {
+      const b = document.createElement("button");
+      b.className = cls;
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+    li.append(name);
+    if (s.custom) {
+      li.append(
+        mk("add", "\u270E", "Edit custom slide", () => editCustom(s)),
+        mk("add", "\u00D7", "Delete custom slide", () => deleteCustom(s)),
+      );
+    }
+    li.append(mk("add", "+", "Add to set list", () => addToSetlist(s)));
+    if (s === song) li.classList.add("active");
+    // The library never drives the output; only set list items do. Double-click adds to the set list.
+    li.addEventListener("dblclick", (e) => { if (!e.target.closest("button")) addToSetlist(s); });
+    list.append(li);
+  }
+}
+
+// The "Last slide" marker is only useful when the song has more than one slide to show (a title slide does not count).
+function showsLastMarker(i) {
+  return i === slides.length - 1 && slides.filter((s) => !s.isTitle).length > 1;
+}
+
+function renderSlideList() {
+  const list = $("slides");
+  list.replaceChildren();
+  slides.forEach((slide, i) => {
+    const li = document.createElement("li");
+    if (i === index) li.classList.add("active");
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = slide.isTitle ? "Title" : `Slide ${i + 1 - (slides[0].isTitle ? 1 : 0)}`;
+    if (showsLastMarker(i)) {
+      li.classList.add("last");
+      const tag = document.createElement("span");
+      tag.className = "last-tag";
+      tag.textContent = "Last slide";
+      label.append(tag);
+    }
+    const fallback = slide.video ? "(video)" : slide.image ? "(picture)" : "(image only)";
+    li.append(label, document.createTextNode(slide.text || fallback));
+    li.addEventListener("click", () => { index = i; blank = false; renderSlideList(); publish(); maybeAutoPlayAudio(); });
+    list.append(li);
+  });
+  const active = list.querySelector(".active");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function currentState() {
+  return {
+    title: song ? song.title : "",
+    author: song ? song.author || "" : "",
+    index,
+    isTitle: Boolean(slides[index] && slides[index].isTitle),
+    text: slides[index] ? slides[index].text : "",
+    video: slides[index] && slides[index].video ? slides[index].video : "",
+    image: slides[index] && slides[index].image ? slides[index].image : "",
+    muted: Boolean(slides[index] && slides[index].muted),
+    paused: videoPaused,
+    bg: song && song.bg ? song.bg : "",
+    dim: song && song.bg ? song.dim : 0,
+    blank: blank || !song,
+  };
+}
+
+// "Last slide" badge on the operator preview only; it is never sent to the output window or the online viewer.
+const lastBadge = document.createElement("div");
+lastBadge.className = "last-badge";
+lastBadge.textContent = "Last slide";
+lastBadge.hidden = true;
+previewEl.append(lastBadge);
+
+function publish() {
+  const state = currentState();
+  lastBadge.hidden = !(song && showsLastMarker(index));
+  if (state.video !== lastVideoKey) { lastVideoKey = state.video; videoPaused = false; state.paused = false; }
+  $("video-controls").hidden = !state.video;
+  $("video-play").textContent = videoPaused ? "Play (K)" : "Pause (K)";
+  $("blank").classList.toggle("active", state.blank);
+  // The output window is always silent; the sound of a video plays here, in the window the operator has clicked
+  // (browsers only allow sound after a click). It is muted while Live is off, so nothing is heard that the audience is not shown.
+  renderSlide(previewEl, state, currentTheme(), { mute: !live });
+  // The preview shows the slide as written, labels included. The output window gets the lyrics only (sheet songs);
+  // while Live is off it gets a blank screen instead.
+  const out = { ...state };
+  if (song && !song.custom && !state.isTitle && !state.video) out.text = stripSectionLabels(state.text);
+  if (!live) out.blank = true;
+  lastSent = { state: out, theme: currentTheme() };
+  channel.postMessage(lastSent);
+  relayPublisher.send(lastSent);
+}
+
+// ---------- Online mirror (phone viewer) ----------
+const relayPublisher = createPublisher((text) => { $("relay-status").textContent = text; });
+
+let qrShown = ""; // text the QR code currently on screen was made for
+
+async function renderRelayQr(text) {
+  if (text === qrShown) return;
+  qrShown = text;
+  const img = $("relay-qr");
+  const msg = $("relay-qr-msg");
+  const old = img.src;
+  try {
+    const { makeQr } = await import("./qr.js");
+    const blob = await makeQr(text);
+    if (qrShown !== text) return; // a newer code was made meanwhile
+    img.src = URL.createObjectURL(blob);
+    img.hidden = false;
+    msg.hidden = true;
+  } catch (err) {
+    console.error("QR code failed", err && err.message);
+    qrShown = "";
+    img.hidden = true;
+    msg.hidden = false;
+    msg.textContent = "The QR code could not be created. The access code and link above still work.";
+  }
+  if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+}
+
+function fillRelayForm() {
+  const r = loadRelay();
+  if (!r.code) { r.code = generateCode(); saveRelay(r); }
+  $("relay-enabled").checked = r.enabled;
+  $("relay-server").value = r.server;
+  $("relay-code").value = r.code;
+  $("relay-viewer-url").value = r.viewerUrl;
+  $("relay-link").value = viewerLink(r);
+  if (!$("drawer").hidden) renderRelayQr(qrText(r)); // the QR library is only loaded once Settings is open
+}
+
+function readRelayForm() {
+  const prev = loadRelay();
+  const server = normalizeServer($("relay-server").value);
+  if (!server) setStatus("The relay server must be an HTTPS address. The old value was kept");
+  const r = { ...prev, enabled: $("relay-enabled").checked, server: server || prev.server, viewerUrl: $("relay-viewer-url").value.trim() };
+  saveRelay(r);
+  fillRelayForm();
+  if (!r.enabled) $("relay-status").textContent = "Off";
+  return r;
+}
+
+for (const id of ["relay-enabled", "relay-server", "relay-viewer-url"]) {
+  $(id).addEventListener("change", () => { readRelayForm(); publish(); });
+}
+$("relay-new-code").addEventListener("click", () => {
+  const r = loadRelay();
+  r.code = generateCode();
+  saveRelay(r);
+  fillRelayForm();
+  publish();
+});
+
+// cmd: "toggle" | "restart"
+function sendVideo(cmd) {
+  if (!lastVideoKey) return;
+  let wire = cmd;
+  if (cmd === "toggle") { videoPaused = !videoPaused; wire = videoPaused ? "pause" : "play"; }
+  else if (cmd === "restart") videoPaused = false;
+  $("video-play").textContent = videoPaused ? "Play (K)" : "Pause (K)";
+  videoCommand(previewEl, wire);
+  if (live) channel.postMessage({ cmd: wire });
+}
+
+function toggleLive() {
+  live = !live;
+  $("live").classList.toggle("active", live);
+  $("live").setAttribute("aria-pressed", String(live));
+  previewEl.classList.toggle("live", live);
+  publish(); // going live sends the current slide to the output; going off blanks it
+}
+
+// If the browser still blocked the sound (no click or key press yet), the next one turns it on.
+document.addEventListener("pointerdown", () => unlockSound(previewEl));
+document.addEventListener("keydown", () => unlockSound(previewEl));
+
+// ---------- Google Drive audio ----------
+function driveMessage(msg) {
+  const el = $("drive-status");
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+
+function driveErrorText(err) {
+  if (err instanceof DriveError) return err.message;
+  console.error(err);
+  return "Something went wrong with Google Drive";
+}
+
+async function downloadDriveAudio(item, btn) {
+  if (!driveKey) {
+    driveMessage("Add a Google API key in Settings to download files.");
+    return;
+  }
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "\u2026";
+  driveMessage(`Downloading ${item.name}\u2026`);
+  try {
+    const blob = await fetchAudio(item.id, driveKey);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = /\.mp3$/i.test(item.name) ? item.name : `${item.name}.mp3`;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    driveMessage("");
+  } catch (err) {
+    driveMessage(driveErrorText(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevText;
+  }
+}
+
+function renderDrive() {
+  const summary = $("audio-panel-summary");
+  if (summary) summary.innerHTML = 'Google Drive audio <small>(+ adds to set)</small>';
+  $("drive-path").textContent = driveFolderId ? ["Folder", ...drivePath.map((p) => p.name)].join(" / ") : "";
+  $("drive-refresh").disabled = !driveFolderId || !driveKey;
+  const list = $("drive-files");
+  list.replaceChildren();
+  if (drivePath.length) {
+    const up = document.createElement("li");
+    up.className = "folder";
+    up.textContent = "\u2190 Back";
+    up.addEventListener("click", () => { drivePath.pop(); $("drive-search").value = ""; refreshDrive(true); });
+    list.append(up);
+  }
+  const query = $("drive-search").value.trim().toLowerCase();
+  const shown = query ? driveItems.filter((item) => item.name.toLowerCase().includes(query)) : driveItems;
+  if (query && driveItems.length && !shown.length) {
+    const none = document.createElement("li");
+    none.className = "none";
+    none.textContent = "No matches in this folder";
+    list.append(none);
+  }
+  for (const item of shown) {
+    const li = document.createElement("li");
+    li.className = item.kind;
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = item.kind === "folder" ? `\u{1F4C1} ${item.name}` : `\u266A ${item.name.replace(/\.mp3$/i, "")}`;
+    li.append(name);
+    if (item.kind === "folder") {
+      li.addEventListener("click", () => { drivePath.push({ id: item.id, name: item.name }); $("drive-search").value = ""; refreshDrive(true); });
+    } else {
+      const download = document.createElement("button");
+      download.className = "add";
+      download.textContent = "\u2913";
+      download.title = "Download audio file locally";
+      download.addEventListener("click", (e) => {
+        e.stopPropagation();
+        downloadDriveAudio(item, download);
+      });
+      li.append(download);
+
+      const add = document.createElement("button");
+      add.className = "add";
+      add.textContent = "+";
+      add.title = "Add to audio set list";
+      add.addEventListener("click", (e) => { e.stopPropagation(); addToAudioSet(item); });
+      li.append(add);
+      li.addEventListener("dblclick", (e) => { if (!e.target.closest("button")) addToAudioSet(item); });
+    }
+    list.append(li);
+  }
+}
+
+function renderLocalAudio() {
+  const summary = $("audio-panel-summary");
+  if (summary) summary.innerHTML = 'Local audio library <small>(+ adds to set)</small>';
+  $("drive-refresh").disabled = false;
+  driveMessage("");
+
+  const pathText = localAudioPath.length ? ["Local Audio", ...localAudioPath].join(" / ") : "Local Audio";
+  $("drive-path").textContent = localAudioTracks.length ? pathText : "";
+
+  const list = $("drive-files");
+  list.replaceChildren();
+
+  if (!localAudioTracks.length) {
+    const li = document.createElement("li");
+    li.className = "none";
+    li.textContent = "No local audio files loaded. Open Settings (I) to select audio files or a folder.";
+    list.append(li);
+    return;
+  }
+
+  if (localAudioPath.length) {
+    const up = document.createElement("li");
+    up.className = "folder";
+    up.textContent = "\u2190 Back";
+    up.addEventListener("click", () => {
+      localAudioPath.pop();
+      $("drive-search").value = "";
+      renderAudioBrowser();
+    });
+    list.append(up);
+  }
+
+  const query = $("drive-search").value.trim().toLowerCase();
+  if (query) {
+    const matches = localAudioTracks.filter((t) => t.name.toLowerCase().includes(query) || (t.path && t.path.toLowerCase().includes(query)));
+    if (!matches.length) {
+      const none = document.createElement("li");
+      none.className = "none";
+      none.textContent = "No matching audio files";
+      list.append(none);
+      return;
+    }
+    for (const track of matches) {
+      appendLocalAudioLi(list, track);
+    }
+    return;
+  }
+
+  const currentPrefix = localAudioPath.join("/") + (localAudioPath.length ? "/" : "");
+  const foldersInDir = new Set();
+  const filesInDir = [];
+
+  for (const track of localAudioTracks) {
+    let p = track.path || track.name;
+    if (currentPrefix) {
+      if (!p.startsWith(currentPrefix)) continue;
+      p = p.slice(currentPrefix.length);
+    }
+    const parts = p.split("/");
+    if (parts.length > 1) {
+      foldersInDir.add(parts[0]);
+    } else {
+      filesInDir.push(track);
+    }
+  }
+
+  const sortedFolders = Array.from(foldersInDir).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const f of sortedFolders) {
+    const li = document.createElement("li");
+    li.className = "folder";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = `\u{1F4C1} ${f}`;
+    li.append(name);
+    li.addEventListener("click", () => {
+      localAudioPath.push(f);
+      $("drive-search").value = "";
+      renderAudioBrowser();
+    });
+    list.append(li);
+  }
+
+  filesInDir.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  for (const track of filesInDir) {
+    appendLocalAudioLi(list, track);
+  }
+}
+
+function appendLocalAudioLi(list, track) {
+  const li = document.createElement("li");
+  li.className = "audio";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = `\u266A ${trackTitle(track.name)}`;
+  li.append(name);
+
+  const add = document.createElement("button");
+  add.className = "add";
+  add.textContent = "+";
+  add.title = "Add to audio set list";
+  add.addEventListener("click", (e) => { e.stopPropagation(); addToAudioSet({ id: track.id, name: track.name, local: true }); });
+  li.append(add);
+  li.addEventListener("dblclick", (e) => {
+    if (!e.target.closest("button")) addToAudioSet({ id: track.id, name: track.name, local: true });
+  });
+  list.append(li);
+}
+
+function renderAudioBrowser() {
+  if (audioSource === "local") {
+    renderLocalAudio();
+  } else {
+    renderDrive();
+  }
+}
+
+// Loads the listing of the current folder. Without force it does nothing when it is already loaded.
+async function refreshDrive(force) {
+  if (audioSource === "local") {
+    renderLocalAudio();
+    return;
+  }
+  if (driveFolderBad) { driveItems = []; renderDrive(); driveMessage("That is not a Google Drive folder link. Fix it in Settings."); return; }
+  if (!driveFolderId) { driveItems = []; renderDrive(); driveMessage("Add a Google Drive folder URL in Settings (burger menu)."); return; }
+  if (!driveKey) { driveItems = []; renderDrive(); driveMessage("Add a Google API key in Settings to list the folder."); return; }
+  const folder = drivePath.length ? drivePath[drivePath.length - 1].id : driveFolderId;
+  const signature = `${folder}|${driveKey}`;
+  if (!force && signature === driveLoaded) return;
+  const token = ++driveToken;
+  driveMessage("Loading folder\u2026");
+  try {
+    const items = await listFolder(folder, driveKey);
+    if (token !== driveToken) return;
+    driveItems = items;
+    driveLoaded = signature;
+    renderDrive();
+    driveMessage(items.length ? "" : "No MP3 files or folders here.");
+  } catch (err) {
+    if (token !== driveToken) return;
+    driveItems = [];
+    driveLoaded = "";
+    renderDrive();
+    driveMessage(driveErrorText(err));
+  }
+}
+
+// ---------- Audio set list ----------
+const trackTitle = (name) => name.replace(/\.(mp3|wav|ogg|m4a|aac|flac)$/i, "");
+
+function loadAudioSet() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(AUDIOSET_KEY));
+    audioSet = Array.isArray(raw)
+      ? raw.filter((x) => x && typeof x.id === "string" && (isDriveId(x.id) || MEDIA_ID_RE.test(x.id)) && typeof x.name === "string")
+        .slice(0, MAX_SETLIST).map((x) => ({ id: x.id, name: x.name.slice(0, 300), local: Boolean(x.local || MEDIA_ID_RE.test(x.id)) }))
+      : [];
+  } catch {
+    audioSet = [];
+  }
+}
+
+function saveAudioSet() {
+  localStorage.setItem(AUDIOSET_KEY, JSON.stringify(audioSet));
+}
+
+function addToAudioSet(item) {
+  if (audioSet.length >= MAX_SETLIST) return;
+  audioSet.push({ id: item.id, name: item.name, local: Boolean(item.local || MEDIA_ID_RE.test(item.id)) });
+  saveAudioSet();
+  renderAudioSet();
+}
+
+function removeFromAudioSet(i) {
+  audioSet.splice(i, 1);
+  if (audioIndex === i) audioIndex = -1; // the track already in the player keeps playing
+  else if (audioIndex > i) audioIndex -= 1;
+  saveAudioSet();
+  renderAudioSet();
+}
+
+function reorderAudioSet(from, to) {
+  const [item] = audioSet.splice(from, 1);
+  audioSet.splice(to, 0, item);
+  if (audioIndex === from) audioIndex = to;
+  else if (from < audioIndex && to >= audioIndex) audioIndex -= 1;
+  else if (from > audioIndex && to <= audioIndex) audioIndex += 1;
+  saveAudioSet();
+  renderAudioSet();
+}
+
+function renderAudioSet() {
+  const list = $("aset-list");
+  list.replaceChildren();
+  $("aset-count").textContent = audioSet.length ? `(${audioSet.length})` : "";
+  $("aset-prev").disabled = $("aset-next").disabled = !audioSet.length;
+  if (!audioSet.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Empty. Press + on an audio track to add it.";
+    list.append(li);
+    return;
+  }
+  audioSet.forEach((track, i) => {
+    const li = document.createElement("li");
+    if (i === audioIndex) li.classList.add("active");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = trackTitle(track.name);
+    li.append(name);
+    const mk = (label, title, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+    li.append(mk("\u00D7", "Remove from audio set list", () => removeFromAudioSet(i)));
+    makeDraggable(li, "audioset", i, () => audioSet.length, reorderAudioSet);
+    li.addEventListener("click", () => { if (!dragJustEnded) playAudioAt(i); });
+    list.append(li);
+  });
+}
+
+// Plays the audio set list entry at position i.
+async function playAudioAt(i) {
+  const track = audioSet[i];
+  if (!track) return;
+  const audio = $("drive-audio");
+  const token = ++playToken;
+  audioIndex = i;
+  renderAudioSet();
+  $("drive-player").hidden = false;
+  if (track.id === playingId && audioUrl) { // already loaded: just restart it
+    $("drive-now").textContent = trackTitle(track.name);
+    audio.currentTime = 0;
+    audio.play().catch(() => {});
+    return;
+  }
+  $("drive-now").textContent = `Loading ${trackTitle(track.name)}\u2026`;
+  try {
+    let url = "";
+    if (MEDIA_ID_RE.test(track.id) || track.local) {
+      url = await getMediaUrl(track.id);
+      if (!url) throw new Error("Local audio track not found in storage");
+    } else if (isDriveId(track.id)) {
+      const blob = await fetchAudio(track.id, driveKey);
+      if (token !== playToken) return;
+      if (audioUrl && !playingIsLocal) URL.revokeObjectURL(audioUrl);
+      url = URL.createObjectURL(blob);
+    } else {
+      throw new Error("Invalid track ID");
+    }
+
+    if (token !== playToken) return;
+    audioUrl = url;
+    playingId = track.id;
+    playingIsLocal = Boolean(MEDIA_ID_RE.test(track.id) || track.local);
+    audio.src = audioUrl;
+    $("drive-now").textContent = trackTitle(track.name);
+    audio.play().catch(() => { $("drive-now").textContent = `${trackTitle(track.name)} (press play)`; });
+  } catch (err) {
+    if (token !== playToken) return;
+    $("drive-now").textContent = isDriveId(track.id) ? driveErrorText(err) : (err.message || "Could not play audio");
+  }
+}
+
+// Next / previous track in the audio set list.
+function goTrack(delta) {
+  if (!audioSet.length) return;
+  const i = audioIndex < 0 ? (delta > 0 ? 0 : audioSet.length - 1) : audioIndex + delta;
+  if (i >= 0 && i < audioSet.length) playAudioAt(i);
+}
+// ---------- Custom slides ----------
+// Validated copy of a stored/imported custom slide, or null if it is not one.
+function sanitizeCustom(x) {
+  if (!x || typeof x.title !== "string" || typeof x.lyrics !== "string") return null;
+  return {
+    title: x.title.slice(0, 300),
+    lyrics: x.lyrics.slice(0, MAX_CUSTOM_TEXT),
+    author: "",
+    custom: true,
+    esv: x.esv === true,
+    bg: typeof x.bg === "string" && BG_RE.test(x.bg) ? x.bg : "",
+    dim: Math.max(0, Math.min(80, Number(x.dim) || 0)),
+    video: typeof x.video === "string" && MEDIA_ID_RE.test(x.video) ? x.video : "",
+    muted: x.muted === true,
+    deck: Array.isArray(x.deck)
+      ? x.deck
+          .filter((d) => d && typeof d.text === "string" && (d.image === "" || MEDIA_ID_RE.test(d.image)))
+          .slice(0, MAX_DECK_SLIDES)
+          .map((d) => ({ text: d.text.slice(0, MAX_DECK_TEXT), image: d.image }))
+      : [],
+  };
+}
+
+function loadCustoms() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CUSTOM_KEY));
+    customs = Array.isArray(raw)
+      ? raw.map(sanitizeCustom).filter(Boolean).slice(0, MAX_CUSTOM)
+      : [];
+  } catch {
+    customs = [];
+  }
+}
+
+function customLabel(s) {
+  if (s.video) return "Video";
+  if (s.deck && s.deck.length) return `Presentation (${s.deck.length} slides)`;
+  return s.esv ? "Bible (ESV)" : "Custom slide";
+}
+
+// Every media id still used by a saved slide or by the editor.
+function usedMediaIds() {
+  const keep = new Set();
+  const add = (m) => { if (m) keep.add(m); };
+  const scan = (s) => { add(s.video); for (const d of s.deck || []) add(d.image); };
+  customs.forEach(scan);
+  if (customMedia) { add(customMedia.video); for (const d of customMedia.deck || []) add(d.image); }
+  if (song) scan(song);
+  add(config && config.theme ? config.theme.blankImage : "");
+  add(config && config.theme ? config.theme.backgroundImage : "");
+  for (const track of localAudioTracks) add(track.id);
+  for (const track of audioSet) if (MEDIA_ID_RE.test(track.id)) add(track.id);
+  return keep;
+}
+
+// Removes stored videos/pictures nothing refers to any more. Skipped while an import is in progress.
+async function cleanupMedia() {
+  if (importing) return;
+  try { await pruneMedia(usedMediaIds()); } catch (err) { console.error(err); }
+}
+
+// Returns false (and tells the user) if the browser's storage quota is exceeded.
+function saveCustoms() {
+  try {
+    localStorage.setItem(CUSTOM_KEY, JSON.stringify(customs));
+    return true;
+  } catch (err) {
+    console.error(err);
+    setStatus("Could not save: browser storage is full. Use a smaller image or delete some custom slides.");
+    return false;
+  }
+}
+
+function readCustomForm() {
+  const lyrics = $("custom-text").value.slice(0, MAX_CUSTOM_TEXT);
+  if (importing) { setStatus("Wait for the file to finish importing"); return null; }
+  if (!lyrics.trim() && !customBg && !customMedia) { setStatus("Type some text, or choose an image, video or presentation first"); return null; }
+  const title = $("custom-title").value.trim().slice(0, 300) || (customMedia && customMedia.name) || "Custom slide";
+  const dim = Math.max(0, Math.min(80, parseInt($("custom-dim").value, 10) || 0));
+  const m = customMedia || {};
+  return {
+    title, lyrics, author: "", custom: true, esv: Boolean(editing && editing.esv), bg: customBg, dim,
+    video: m.video || "", muted: Boolean(m.video && $("custom-muted").checked), deck: m.deck || [],
+  };
+}
+
+function renderMediaInfo() {
+  const info = $("custom-media-info");
+  const m = customMedia;
+  info.hidden = !m;
+  $("custom-media-clear").hidden = !m;
+  $("custom-mute-row").hidden = !(m && m.video);
+  if (!m) { info.textContent = ""; return; }
+  info.textContent = m.video
+    ? `Video: ${m.name}. The lyrics box is used as an optional caption.`
+    : `Presentation: ${m.name} (${m.deck.length} slides). The lyrics box is ignored.`;
+}
+
+function renderBgPreview() {
+  const box = $("custom-bg-preview");
+  box.style.backgroundImage = customBg ? `url("${customBg}")` : "none";
+  box.hidden = !customBg;
+  $("custom-bg-clear").hidden = !customBg;
+  $("custom-dim-row").hidden = !customBg;
+}
+
+function resetCustomForm() {
+  editing = null;
+  customBg = "";
+  $("custom-title").value = "";
+  $("custom-text").value = "";
+  $("custom-dim").value = "40";
+  $("custom-bg-file").value = "";
+  $("custom-media-file").value = "";
+  $("custom-muted").checked = false;
+  customMedia = null;
+  $("custom-save").textContent = "Save to library";
+  renderBgPreview();
+  renderMediaInfo();
+  cleanupMedia();
+}
+
+function editCustom(s) {
+  editing = s;
+  customBg = s.bg || "";
+  $("custom-title").value = s.title;
+  $("custom-text").value = s.lyrics;
+  $("custom-dim").value = String(s.dim || 0);
+  customMedia = s.video || (s.deck && s.deck.length)
+    ? { video: s.video || "", deck: s.deck || [], name: s.video ? "saved video" : "saved presentation" }
+    : null;
+  $("custom-muted").checked = Boolean(s.muted);
+  $("custom-save").textContent = "Update saved slide";
+  $("custom-editor").open = true;
+  renderBgPreview();
+  renderMediaInfo();
+  $("custom-editor").scrollIntoView({ block: "nearest" });
+}
+
+// Loads an image file, downscales it and re-encodes as JPEG so it fits in localStorage.
+async function pickBackground(file) {
+  if (!file) return;
+  if (!/^image\/(jpeg|png|webp|gif)$/.test(file.type)) { setStatus("Choose a JPG, PNG, WebP or GIF image"); return; }
+  if (file.size > MAX_IMAGE_FILE) { setStatus("Image is too large (15 MB maximum)"); return; }
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = objectUrl;
+    await img.decode();
+    const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+    if (!BG_RE.test(dataUrl)) throw new Error("Unsupported image");
+    customBg = dataUrl;
+    renderBgPreview();
+    setStatus("Background image added");
+  } catch (err) {
+    console.error(err);
+    setStatus("Could not read that image");
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+// Automatically exports presentation slides (or PDF pages) as images, saves to library, and adds to set list.
+async function importPresentation(file) {
+  if (!file) return;
+  const name = file.name.toLowerCase();
+  const isPdf = name.endsWith(".pdf") || file.type === "application/pdf";
+  try {
+    if (!isPdf && name.endsWith(".ppt")) throw new ImportError("Old .ppt files are not supported. In PowerPoint use Save As and choose .pptx.");
+    if (!isPdf && !/\.(pptx|ppsx|odp)$/.test(name)) throw new ImportError("Choose a .pdf, .pptx, .ppsx or .odp file");
+    if (file.size > 200 * 1024 * 1024) throw new ImportError("This file is too large (200 MB maximum)");
+  } catch (err) {
+    setStatus(describeImportError(err));
+    $("custom-media-file").value = "";
+    return;
+  }
+
+  if (importing) { setStatus("Wait for the file to finish importing"); return; }
+  importing = true;
+  const created = [];
+  try {
+    setStatus(isPdf ? `Reading ${file.name}â€¦` : `Exporting slides from ${file.name} as imagesâ€¦`);
+    let deck = [];
+    let convertedOnServer = false;
+
+    if (isPdf) {
+      // Every page is drawn exactly as the PDF defines it (layout, fonts, graphics) and kept as a picture, which is
+      // shown fitted to the screen without cropping or stretching, so the slide matches the PDF page.
+      await renderPdf(file, async (blob) => {
+        if (deck.length >= MAX_PDF_PAGES) throw new ImportError(`Too many pages (${MAX_PDF_PAGES} maximum)`);
+        const id = await putMedia(blob);
+        created.push(id);
+        deck.push({ text: "", image: id });
+      }, (done, total) => setStatus(`Converting ${file.name}: page ${done} of ${total}â€¦`));
+      convertedOnServer = true; // skips the PowerPoint/LibreOffice conversion below
+    }
+
+    if (!isPdf) try {
+      const res = await fetch("/api/convert-pptx", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Filename": encodeURIComponent(file.name),
+        },
+        body: file,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.slides && data.slides.length) {
+          setStatus(`Saving ${data.slides.length} slide imagesâ€¦`);
+          for (const dataUrl of data.slides.slice(0, MAX_DECK_SLIDES)) {
+            const blob = await (await fetch(dataUrl)).blob();
+            const id = await putMedia(blob);
+            created.push(id);
+            deck.push({ text: "", image: id });
+          }
+          convertedOnServer = true;
+        }
+      } else {
+        const errData = await res.json().catch(() => null);
+        console.warn("Server presentation conversion failed:", errData || res.statusText);
+      }
+    } catch (netErr) {
+      console.warn("Could not reach conversion server, falling back to client parser:", netErr);
+    }
+
+    if (!convertedOnServer) {
+      setStatus(`Reading ${file.name}â€¦`);
+      const { slides: deckSlides } = await readPresentation(file);
+      for (const s of deckSlides.slice(0, MAX_DECK_SLIDES)) {
+        let image = "";
+        if (s.picture) {
+          const jpeg = await imageToJpegBlob(s.picture, 1920).catch(() => null);
+          if (jpeg) { image = await putMedia(jpeg); created.push(image); }
+        }
+        deck.push({ text: s.text.slice(0, MAX_DECK_TEXT), image });
+      }
+    }
+
+    if (!deck.some((d) => d.text || d.image)) throw new ImportError(isPdf ? "No pages were found in this PDF" : "No slides were found in this presentation");
+
+    const rawTitle = file.name.replace(/\.[^/.]+$/, "").trim() || "Presentation";
+    const title = rawTitle.slice(0, 300);
+    const s = {
+      title,
+      lyrics: "",
+      author: "",
+      custom: true,
+      deck,
+      video: "",
+      bg: "",
+      dim: 0,
+    };
+
+    const existingIndex = customs.findIndex((c) => c.title === title && c.custom);
+    if (existingIndex >= 0) {
+      customs[existingIndex] = s;
+    } else {
+      if (customs.length >= MAX_CUSTOM) throw new ImportError("Custom slide limit reached");
+      customs.unshift(s);
+    }
+    if (!saveCustoms()) {
+      if (existingIndex < 0) customs.shift();
+      throw new ImportError("Browser storage is full. Please remove some custom slides.");
+    }
+
+    renderSongList();
+    addToSetlist(s);
+    playSetlistItem(setlist.length - 1);
+    resetCustomForm();
+    setStatus(`Exported ${deck.length} ${isPdf ? "pages" : "slides"} from "${title}" and added to set list`);
+  } catch (err) {
+    console.error(err);
+    for (const id of created) await deleteMedia(id).catch(() => {});
+    setStatus(describeImportError(err));
+  } finally {
+    importing = false;
+    $("custom-media-file").value = "";
+    cleanupMedia();
+  }
+}
+
+
+// Stores a chosen video or presentation in IndexedDB and shows it in the editor.
+async function pickMedia(file) {
+  if (!file) return;
+  const name = file.name.toLowerCase();
+  const isDeck = /\.(pptx|ppsx|ppt|odp|pdf)$/.test(name) || file.type === "application/pdf";
+  const isVideo = file.type.startsWith("video/") || /\.(mp4|webm|ogv|mov|m4v)$/.test(name);
+  if (!isDeck && !isVideo) { setStatus("Choose a video (MP4, WebM, MOV), a PDF or a presentation (.pptx, .odp)"); $("custom-media-file").value = ""; return; }
+
+  if (isDeck) {
+    await importPresentation(file);
+    return;
+  }
+
+  importing = true;
+  const created = []; // ids stored by this import, removed again if it fails
+  try {
+    if (file.size > MAX_VIDEO_FILE) throw new ImportError("Video is too large (2 GB maximum)");
+    setStatus(`Importing video ${file.name}â€¦`);
+    const id = await putMedia(file);
+    created.push(id);
+    // Make sure this browser can actually play it (e.g. some .mov/.mkv codecs cannot).
+    await checkPlayable(id);
+    customMedia = { video: id, deck: [], name: file.name };
+    renderMediaInfo();
+    setStatus(`Imported ${file.name}`);
+  } catch (err) {
+    console.error(err);
+    for (const id of created) await deleteMedia(id).catch(() => {});
+    $("custom-media-file").value = "";
+    setStatus(describeImportError(err));
+  } finally {
+    importing = false;
+    cleanupMedia();
+  }
+}
+
+// ---------- Lyric slides background image ----------
+function renderThemeBgInfo() {
+  const bgId = config && config.theme && config.theme.backgroundImage ? config.theme.backgroundImage : "";
+  const has = Boolean(bgId);
+  const info = $("theme-bg-info");
+  const clearBtn = $("theme-bg-clear");
+  const dimRow = $("theme-bg-dim-row");
+  const preview = $("theme-bg-preview");
+  if (info) info.textContent = has ? "Background image is active on all lyric slides." : "None: using solid background colour.";
+  if (clearBtn) clearBtn.hidden = !has;
+  if (dimRow) dimRow.hidden = !has;
+  if (preview) preview.hidden = !has;
+  if ($("theme-bg-dim")) {
+    $("theme-bg-dim").value = String(config.theme.backgroundDim != null ? config.theme.backgroundDim : 40);
+  }
+  if (has && preview) {
+    getMediaUrl(bgId).then((url) => {
+      if (url && preview) preview.style.backgroundImage = `url("${url}")`;
+    }).catch(() => {});
+  } else if (preview) {
+    preview.style.backgroundImage = "none";
+  }
+}
+
+async function pickThemeBgImage(file) {
+  if (!file) return;
+  if (!/^image\/(jpeg|png|webp|gif)$/.test(file.type)) { setStatus("Choose a JPG, PNG, WebP or GIF image"); return; }
+  if (file.size > MAX_IMAGE_FILE) { setStatus("Image is too large (15 MB maximum)"); return; }
+  if (importing) { setStatus("Wait for the file to finish importing"); return; }
+  importing = true;
+  try {
+    const id = await putMedia(await imageToJpegBlob(file, 1920));
+    config.theme.backgroundImage = id;
+    if (config.theme.backgroundDim == null) config.theme.backgroundDim = 40;
+    persist();
+    renderThemeBgInfo();
+    publish();
+    setStatus("Lyric slides background image set");
+  } catch (err) {
+    console.error(err);
+    setStatus(describeImportError(err));
+  } finally {
+    importing = false;
+    $("theme-bg-file").value = "";
+  }
+  cleanupMedia();
+}
+
+function clearThemeBgImage() {
+  config.theme.backgroundImage = "";
+  persist();
+  renderThemeBgInfo();
+  publish();
+  setStatus("Lyric slides background image removed");
+  cleanupMedia();
+}
+
+// ---------- Blank screen image ----------
+function renderBlankImageInfo() {
+  const has = Boolean(config.theme.blankImage);
+  $("blank-image-info").textContent = has ? "A picture is shown when the output is blank." : "None: the output goes black when blank.";
+  $("blank-image-clear").hidden = !has;
+}
+
+async function pickBlankImage(file) {
+  if (!file) return;
+  if (!/^image\/(jpeg|png|webp|gif)$/.test(file.type)) { setStatus("Choose a JPG, PNG, WebP or GIF image"); return; }
+  if (file.size > MAX_IMAGE_FILE) { setStatus("Image is too large (15 MB maximum)"); return; }
+  if (importing) { setStatus("Wait for the file to finish importing"); return; }
+  importing = true; // blocks media cleanup until the new picture is saved
+  try {
+    const id = await putMedia(await imageToJpegBlob(file, 1920));
+    config.theme.blankImage = id;
+    persist();
+    renderBlankImageInfo();
+    publish();
+    setStatus("Blank screen image set");
+  } catch (err) {
+    console.error(err);
+    setStatus(describeImportError(err));
+  } finally {
+    importing = false;
+    $("blank-image-file").value = "";
+  }
+  cleanupMedia(); // drops the picture it replaced
+}
+
+function clearBlankImage() {
+  config.theme.blankImage = "";
+  persist();
+  renderBlankImageInfo();
+  publish();
+  setStatus("Blank screen image removed");
+  cleanupMedia();
+}
+
+function describeImportError(err) {
+  if (err instanceof ImportError) return err.message;
+  if (err && err.name === "QuotaExceededError") return "Not enough browser storage for this file. Delete some saved slides or use a smaller file.";
+  return "Could not import that file";
+}
+
+async function checkPlayable(id) {
+  const url = await getMediaUrl(id);
+  await new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    const timer = setTimeout(() => reject(new ImportError("Could not read this video. Try an MP4 (H.264) file.")), 15000);
+    v.preload = "metadata";
+    v.onloadedmetadata = () => { clearTimeout(timer); resolve(); };
+    v.onerror = () => { clearTimeout(timer); reject(new ImportError("This browser cannot play that video. Try an MP4 (H.264) file.")); };
+    v.src = url;
+  });
+}
+
+function deleteCustom(s) {
+  if (!confirm(`Delete custom slide "${s.title}"?`)) return;
+  customs = customs.filter((c) => c !== s);
+  saveCustoms();
+  if (editing === s) resetCustomForm();
+  if (song === s) { song = null; slides = []; index = 0; renderSlideList(); publish(); }
+  renderSongList();
+  renderSetlist();
+  cleanupMedia();
+}
+
+function showCustomNow() {
+  const s = readCustomForm();
+  if (!s) return;
+  // Keep the set list position so Next on the last slide continues with the following song.
+  selectSong(s, setIndex);
+}
+
+// Saves the form to the library and returns the saved slide (null if nothing was saved).
+function saveCustom() {
+  const s = readCustomForm();
+  if (!s) return null;
+  const before = customs.slice();
+  if (editing) {
+    const i = customs.indexOf(editing);
+    if (i >= 0) customs[i] = s;
+  } else {
+    if (customs.length >= MAX_CUSTOM) { setStatus("Custom slide limit reached"); return null; }
+    customs.unshift(s);
+  }
+  if (!saveCustoms()) { customs = before; return null; }
+  resetCustomForm(); // also removes stored media that is no longer used
+  renderSongList();
+  renderSetlist();
+  setStatus(`Saved custom slide "${s.title}"`);
+  return s;
+}
+
+// Saves the form to the library (the set list refers to library entries) and appends it to the set list.
+function addCustomToSet() {
+  if (setlist.length >= MAX_SETLIST) { setStatus("Set list is full"); return; }
+  const s = saveCustom();
+  if (!s) return;
+  addToSetlist(s);
+  setStatus(`Saved "${s.title}" and added it to the set list`);
+}
+
+// ---------- ESV Bible ----------
+// Turns ESV text with "[16]" verse markers into slides of N verses (shown as "16 text", one verse per row). Only the last slide ends with the reference.
+function esvToSlides(text, ref, perSlide) {
+  const verses = text.replace(/\r\n?/g, "\n").split(/(?=\[\d+\])/)
+    .map((v) => v.replace(/\s+/g, " ").replace(/^\[(\d+)\]\s*/, "$1 ").trim())
+    .filter(Boolean);
+  const groups = [];
+  for (let i = 0; i < verses.length; i += perSlide) groups.push(verses.slice(i, i + perSlide).join("\n"));
+  return groups.map((g, i) => (i === groups.length - 1 ? `${g}\n\u2014 ${ref} (ESV)` : g)).join("\n\n");
+}
+
+async function fetchEsv() {
+  const q = $("esv-ref").value.trim();
+  if (!esvKey) { setStatus("Enter your ESV API key in Settings and save it first"); return; }
+  if (!q || q.length > 200 || !ESV_REF_RE.test(q)) { setStatus("Enter a valid reference, e.g. John 3:16-18"); return; }
+  const perSlide = Math.max(1, Math.min(10, parseInt($("esv-per").value, 10) || 2));
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  setStatus("Fetching passageâ€¦");
+  try {
+    // Preferred: the local server's proxy (server.py). When the app is served by something else (a plain static
+    // server or GitHub Pages) there is no proxy and the reply is not JSON, so ask the ESV API directly (it allows CORS).
+    let res = await fetch("/api/esv", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ q, key: esvKey, perSlide }),
+      signal: ctrl.signal,
+      cache: "no-store",
+    }).catch((err) => { if (err.name === "AbortError") throw err; return null; });
+    if (!res || !(res.headers.get("content-type") || "").includes("application/json")) {
+      const params = new URLSearchParams({
+        q,
+        "include-headings": "false",
+        "include-footnotes": "false",
+        "include-verse-numbers": "true",
+        "include-short-copyright": "false",
+        "include-passage-references": "false",
+      });
+      res = await fetch(`https://api.esv.org/v3/passage/text/?${params}`, {
+        headers: { Authorization: `Token ${esvKey}` },
+        signal: ctrl.signal,
+        cache: "no-store",
+      });
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data.error || `ESV request failed (${res.status})`;
+      if (res.status === 401 || res.status === 403) throw new Error("ESV API key was rejected");
+      throw new Error(msg);
+    }
+    const passages = Array.isArray(data.passages) ? data.passages.filter((p) => typeof p === "string" && p.trim()) : [];
+    if (!passages.length) throw new Error("No passage found for that reference");
+
+    const metas = Array.isArray(data.passage_meta) ? data.passage_meta : [];
+    const refOf = (i) => String((metas[i] && metas[i].canonical) || data.canonical || q).slice(0, 200);
+    const lyrics = passages.map((p, i) => esvToSlides(p, refOf(i), perSlide)).join("\n\n");
+    if (lyrics.length > MAX_CUSTOM_TEXT) throw new Error("Passage is too long; request fewer verses");
+
+    esvPending = {
+      title: String(data.canonical || q).slice(0, 300),
+      lyrics,
+      author: "",
+      custom: true,
+      esv: true,
+    };
+    // The blank lines only separate slides in the stored text; the preview box shows the passage as continuous rows.
+    $("esv-preview").value = lyrics.replace(/\n{2,}/g, "\n");
+    for (const id of ["esv-show", "esv-save", "esv-add"]) $(id).disabled = false;
+    setStatus(`Fetched ${esvPending.title}`);
+  } catch (err) {
+    console.error(err);
+    setStatus(err.name === "AbortError" ? "ESV request timed out" : err.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Saves the pending passage to the library (replacing an earlier ESV save of the same reference).
+function storeEsv() {
+  if (!esvPending) return null;
+  const s = esvPending;
+  const i = customs.findIndex((c) => c.esv && c.title === s.title);
+  if (i >= 0) customs[i] = s;
+  else if (customs.length >= MAX_CUSTOM) { setStatus("Custom slide limit reached"); return null; }
+  else customs.unshift(s);
+  saveCustoms();
+  renderSongList();
+  renderSetlist();
+  return s;
+}
+
+// ---------- Resizable columns ----------
+// Column widths are stored as fractions of the window width (library and set list; the preview takes the
+// rest), so the layout scales with the window. By default each of the three columns is 1/3.
+const LAYOUT_KEY = "presentation-layout-v2";
+const MIN_COL = 160;      // narrowest column in px
+const HANDLE_W = 6;
+const DEFAULT_COLS = { lib: 1 / 3, set: 1 / 3 };
+let cols = { ...DEFAULT_COLS };
+
+function totalWidth() { return document.documentElement.clientWidth - 2 * HANDLE_W; }
+
+// Keeps every column at least MIN_COL wide (px in, px out).
+function clampPx(px) {
+  const total = totalWidth();
+  const lib = Math.max(MIN_COL, Math.min(px.lib, total - 2 * MIN_COL));
+  const set = Math.max(MIN_COL, Math.min(px.set, total - lib - MIN_COL));
+  return { lib, set };
+}
+
+// Current column widths in px for the current window size. Does not change `cols`.
+function fitCols(c) {
+  const total = totalWidth();
+  return clampPx({ lib: c.lib * total, set: c.set * total });
+}
+
+function pxToCols(px) {
+  const total = totalWidth();
+  return { lib: px.lib / total, set: px.set / total };
+}
+
+function applyCols() {
+  const fit = fitCols(cols);
+  const app = document.querySelector(".app");
+  app.style.setProperty("--col-lib", `${fit.lib}px`);
+  app.style.setProperty("--col-set", `${fit.set}px`);
+  $("resize-lib").setAttribute("aria-valuenow", String(Math.round(fit.lib)));
+  $("resize-set").setAttribute("aria-valuenow", String(Math.round(fit.set)));
+  return fit;
+}
+
+function saveCols() {
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(cols)); } catch { /* layout just isn't remembered */ }
+}
+
+function loadCols() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LAYOUT_KEY));
+    if (raw && Number.isFinite(raw.lib) && Number.isFinite(raw.set) && raw.lib > 0 && raw.set > 0 && raw.lib + raw.set < 1) {
+      cols = { lib: raw.lib, set: raw.set };
+    }
+  } catch { /* use defaults */ }
+}
+
+function setupResizer(handle, key) {
+  let startX = 0;
+  let startPx = { lib: 0, set: 0 };
+
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    startX = e.clientX;
+    startPx = fitCols(cols);
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing");
+    e.preventDefault();
+  });
+
+  handle.addEventListener("pointermove", (e) => {
+    if (!handle.hasPointerCapture(e.pointerId)) return;
+    cols = pxToCols(clampPx({ ...startPx, [key]: startPx[key] + (e.clientX - startX) }));
+    applyCols();
+  });
+
+  const end = (e) => {
+    if (!handle.hasPointerCapture(e.pointerId)) return;
+    handle.releasePointerCapture(e.pointerId);
+    handle.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    saveCols();
+  };
+  handle.addEventListener("pointerup", end);
+  handle.addEventListener("pointercancel", end);
+
+  handle.addEventListener("dblclick", () => {
+    cols = { ...cols, [key]: DEFAULT_COLS[key] };
+    cols = pxToCols(fitCols(cols));
+    applyCols();
+    saveCols();
+  });
+
+  // Keyboard: arrow keys resize (Shift = bigger steps), Home resets.
+  handle.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? 64 : 16;
+    const px = fitCols(cols);
+    if (e.key === "ArrowLeft") px[key] -= step;
+    else if (e.key === "ArrowRight") px[key] += step;
+    else if (e.key === "Home") px[key] = DEFAULT_COLS[key] * totalWidth();
+    else return;
+    e.preventDefault();
+    cols = pxToCols(clampPx(px));
+    applyCols();
+    saveCols();
+  });
+}
+
+function initLayout() {
+  loadCols();
+  applyCols();
+  setupResizer($("resize-lib"), "lib");
+  setupResizer($("resize-set"), "set");
+  window.addEventListener("resize", applyCols); // refit without forgetting the preferred sizes
+}
+
+// ---------- Settings drawer ----------
+function setDrawer(open) {
+  $("drawer").hidden = !open;
+  if (open) fillRelayForm();
+  $("backdrop").hidden = !open;
+  $("menu-btn").setAttribute("aria-expanded", String(open));
+  if (open) $("sheet-id").focus();
+  else $("menu-btn").focus();
+}
+
+// ---------- Events ----------
+$("menu-btn").addEventListener("click", () => setDrawer($("drawer").hidden));
+$("menu-close").addEventListener("click", () => setDrawer(false));
+$("backdrop").addEventListener("click", () => setDrawer(false));
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("drawer").hidden) { e.preventDefault(); setDrawer(false); }
+});
+$("esv-fetch").addEventListener("click", fetchEsv);
+$("esv-ref").addEventListener("keydown", (e) => { if (e.key === "Enter") fetchEsv(); });
+$("esv-show").addEventListener("click", () => { if (esvPending) selectSong(esvPending, setIndex); });
+$("esv-save").addEventListener("click", () => {
+  const s = storeEsv();
+  if (s) setStatus(`Saved ${s.title} to the library`);
+});
+$("esv-add").addEventListener("click", () => {
+  const s = storeEsv();
+  if (s) { addToSetlist(s); setStatus(`Added ${s.title} to the set list`); }
+});
+$("custom-media-file").addEventListener("change", (e) => pickMedia(e.target.files[0]));
+$("custom-media-clear").addEventListener("click", () => {
+  customMedia = null;
+  $("custom-media-file").value = "";
+  renderMediaInfo();
+  cleanupMedia();
+});
+$("video-play").addEventListener("click", () => sendVideo("toggle"));
+$("video-restart").addEventListener("click", () => sendVideo("restart"));
+$("custom-bg-file").addEventListener("change", (e) => pickBackground(e.target.files[0]));
+$("custom-bg-clear").addEventListener("click", () => { customBg = ""; $("custom-bg-file").value = ""; renderBgPreview(); });
+$("custom-show").addEventListener("click", showCustomNow);
+$("custom-save").addEventListener("click", saveCustom);
+$("custom-add").addEventListener("click", addCustomToSet);
+$("custom-clear").addEventListener("click", resetCustomForm);
+$("search").addEventListener("input", renderSongList);
+$("prev").addEventListener("click", () => go(-1));
+$("next").addEventListener("click", () => go(1));
+$("blank").addEventListener("click", toggleBlank);
+$("live").addEventListener("click", toggleLive);
+if ($("theme-bg-file")) $("theme-bg-file").addEventListener("change", (e) => pickThemeBgImage(e.target.files[0]));
+if ($("theme-bg-clear")) $("theme-bg-clear").addEventListener("click", clearThemeBgImage);
+if ($("theme-bg-dim")) {
+  $("theme-bg-dim").addEventListener("input", (e) => {
+    config.theme.backgroundDim = Math.max(0, Math.min(80, parseInt(e.target.value, 10) || 0));
+    persist();
+    publish();
+  });
+}
+$("blank-image-file").addEventListener("change", (e) => pickBlankImage(e.target.files[0]));
+$("blank-image-clear").addEventListener("click", clearBlankImage);
+$("drive-refresh").addEventListener("click", () => refreshDrive(true));
+$("drive-search").addEventListener("input", renderAudioBrowser);
+
+if ($("song-source")) {
+  $("song-source").addEventListener("change", () => {
+    updateSourceVisibility();
+  });
+}
+if ($("audio-source")) {
+  $("audio-source").addEventListener("change", () => {
+    updateSourceVisibility();
+  });
+}
+if ($("local-songs-file")) {
+  $("local-songs-file").addEventListener("change", (e) => importLocalSongsFile(e.target.files[0]));
+}
+if ($("reset-default-songs")) {
+  $("reset-default-songs").addEventListener("click", resetDefaultSongs);
+}
+if ($("local-audio-folder")) {
+  $("local-audio-folder").addEventListener("change", (e) => importLocalAudioFiles(e.target.files));
+}
+if ($("local-audio-files")) {
+  $("local-audio-files").addEventListener("change", (e) => importLocalAudioFiles(e.target.files));
+}
+if ($("choose-audio-files-btn") && $("local-audio-files")) {
+  $("choose-audio-files-btn").addEventListener("click", () => $("local-audio-files").click());
+}
+if ($("clear-local-audio")) {
+  $("clear-local-audio").addEventListener("click", clearLocalAudio);
+}
+$("aset-prev").addEventListener("click", () => goTrack(-1));
+$("aset-next").addEventListener("click", () => goTrack(1));
+$("aset-clear").addEventListener("click", () => {
+  if (audioSet.length && confirm("Clear the whole audio set list?")) { audioSet = []; audioIndex = -1; saveAudioSet(); renderAudioSet(); }
+});
+$("prev-song").addEventListener("click", () => goSong(-1));
+$("next-song").addEventListener("click", () => goSong(1));
+$("set-clear").addEventListener("click", () => {
+  if (setlist.length && confirm("Clear the whole set list?")) {
+    setlist = []; setIndex = -1; saveSetlist(); renderSetlist();
+  }
+});
+$("set-export").addEventListener("click", exportSetlist);
+$("set-import").addEventListener("click", () => $("set-file").click());
+$("set-file").addEventListener("change", (e) => {
+  importSetlist(e.target.files[0]);
+  e.target.value = "";
+});
+// Downloads every setting as it currently stands in the Settings form (saved or not), including URLs and API keys.
+// Pictures (background / blank screen) are stored in this browser only, so they are left out.
+function exportSettings() {
+  const theme = { ...config.theme, backgroundImage: "", blankImage: "" };
+  theme.background = $("bg").value;
+  theme.color = $("fg").value;
+  theme.fontSize = Math.max(2, Math.min(20, parseFloat($("size").value) || 7));
+  theme.autoFit = $("auto-fit").checked;
+  theme.align = $("align").value;
+  theme.uppercase = $("uppercase").checked;
+  theme.showTitle = $("show-title").checked;
+  if ($("theme-bg-dim")) theme.backgroundDim = Math.max(0, Math.min(80, parseInt($("theme-bg-dim").value, 10) || 0));
+  const data = {
+    app: "presentation-settings",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    songSource: $("song-source").value,
+    audioSource: $("audio-source").value,
+    autoPlayAudio: $("auto-play-audio").checked,
+    sheet: { url: $("sheet-id").value.trim(), gid: $("sheet-gid").value.trim() || "0" },
+    drive: { folderUrl: $("drive-folder").value.trim(), apiKey: $("drive-key").value.trim() },
+    esvApiKey: $("esv-key").value.trim(),
+    // The Online mirror settings are saved as soon as they are changed, so the stored values are the current ones.
+    // The access code is a secret, like the API keys.
+    onlineMirror: (() => {
+      const r = loadRelay();
+      return { enabled: r.enabled, server: r.server, viewerUrl: r.viewerUrl, accessCode: r.code };
+    })(),
+    linesPerSlide: Math.max(0, Math.min(20, parseInt($("lines").value, 10) || 0)),
+    theme,
+    layout: presiderMode && normalCols ? normalCols : cols,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `presentation-settings_${fileStamp()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  setStatus("Exported all settings (the file contains your API keys; keep it private)");
+}
+$("export-settings").addEventListener("click", exportSettings);
+
+// Loads a file made by exportSettings(). Every value is validated, put into the Settings form, and then saved through
+// the normal Save settings handler (so changing a source clears its set list and the song library reloads as usual).
+async function importSettings(file) {
+  if (!file) return;
+  if (file.size > 1_000_000) { setStatus("Settings file is too large"); return; }
+  let text;
+  try { text = await file.text(); } catch { setStatus("Could not read settings file"); return; }
+  applySettingsText(text);
+}
+
+// Downloads a settings file from Google Drive (shared as "Anyone with the link can view") and applies it.
+async function importSettingsFromDrive() {
+  const fileId = extractFileId($("drive-settings-url").value);
+  if (!fileId) { setStatus("Paste the Google Drive link of the settings file first"); return; }
+  const key = $("drive-settings-key").value.trim() || $("drive-key").value.trim() || driveKey;
+  if (!key) { setStatus("Add a Google API key (above, or in the Google Drive section) to read the file"); return; }
+  setStatus("Downloading settings from Google Driveâ€¦");
+  let text;
+  try {
+    text = await fetchTextFile(fileId, key);
+  } catch (err) {
+    console.error(err);
+    setStatus(err instanceof DriveError ? err.message : "Could not download the settings file");
+    return;
+  }
+  $("drive-settings-key").value = "";
+  applySettingsText(text);
+}
+
+function applySettingsText(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    setStatus("Could not read settings file");
+    return;
+  }
+  if (!data || typeof data !== "object" || data.app !== "presentation-settings") {
+    setStatus("That is not a settings file made by Export all settings");
+    return;
+  }
+  const str = (v, max = 500) => (typeof v === "string" ? v.slice(0, max) : "");
+  const oneOf = (v, allowed, fallback) => (allowed.includes(v) ? v : fallback);
+  const num = (v, min, max, fallback) => (Number.isFinite(Number(v)) && v !== null && v !== "" ? Math.max(min, Math.min(max, Number(v))) : fallback);
+  const colour = (v, fallback) => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v) ? v : fallback);
+  const sheet = data.sheet && typeof data.sheet === "object" ? data.sheet : {};
+  const drive = data.drive && typeof data.drive === "object" ? data.drive : {};
+  const theme = data.theme && typeof data.theme === "object" ? data.theme : {};
+  const cur = config.theme;
+
+  $("song-source").value = oneOf(data.songSource, ["sheet", "local"], $("song-source").value);
+  $("audio-source").value = oneOf(data.audioSource, ["local", "drive"], $("audio-source").value);
+  $("auto-play-audio").checked = data.autoPlayAudio === true;
+  $("sheet-id").value = str(sheet.url);
+  $("sheet-gid").value = /^\d{1,20}$/.test(str(sheet.gid, 20)) ? sheet.gid : "0";
+  $("drive-folder").value = str(drive.folderUrl);
+  $("drive-key").value = str(drive.apiKey);
+  $("esv-key").value = str(data.esvApiKey);
+  $("lines").value = String(Math.round(num(data.linesPerSlide, 0, 20, 0)));
+  $("bg").value = colour(theme.background, cur.background);
+  $("fg").value = colour(theme.color, cur.color);
+  $("size").value = String(num(theme.fontSize, 2, 20, 7));
+  $("auto-fit").checked = theme.autoFit === true;
+  $("align").value = oneOf(theme.align, ["left", "center", "right"], "center");
+  $("uppercase").checked = theme.uppercase === true;
+  $("show-title").checked = theme.showTitle !== false;
+  if ($("theme-bg-dim")) $("theme-bg-dim").value = String(num(theme.backgroundDim, 0, 80, 40));
+  updateSourceVisibility();
+
+  // Files made before the Online mirror existed have no "onlineMirror" entry: the current mirror settings are kept.
+  if (data.onlineMirror && typeof data.onlineMirror === "object") {
+    const m = data.onlineMirror;
+    const prev = loadRelay();
+    saveRelay({
+      enabled: m.enabled === true,
+      server: normalizeServer(m.server) || prev.server,
+      code: isValidCode(m.accessCode) ? m.accessCode : prev.code,
+      viewerUrl: str(m.viewerUrl, 300), // loadSettings() drops it when it is not an https address
+    });
+    fillRelayForm();
+  }
+
+  const l = data.layout;
+  if (l && Number.isFinite(l.lib) && Number.isFinite(l.set) && l.lib > 0 && l.set > 0 && l.lib + l.set < 1) {
+    if (presiderMode) normalCols = { lib: l.lib, set: l.set };
+    else { cols = { lib: l.lib, set: l.set }; applyCols(); saveCols(); }
+  }
+
+  $("save-settings").click();
+  setStatus("Settings imported");
+}
+$("import-settings").addEventListener("click", () => $("settings-file").click());
+$("import-settings-drive").addEventListener("click", importSettingsFromDrive);
+$("settings-file").addEventListener("change", (e) => {
+  importSettings(e.target.files[0]);
+  e.target.value = "";
+});
+async function reloadSheet() { readSettingsForm(); await loadSongs(); }
+// Opens the output window. When a second display (e.g. HDMI) is attached, the window is opened on that display and
+// output.html goes fullscreen there. Needs the browser's "window management" permission (Chrome/Edge ask once).
+let outputWin = null;
+let screenDetails = null;
+async function loadScreenDetails() {
+  if (screenDetails) return screenDetails;
+  if (!window.screen.isExtended || typeof window.getScreenDetails !== "function") return null;
+  try { screenDetails = await window.getScreenDetails(); } catch (err) { console.error(err); }
+  return screenDetails;
+}
+// The display this window is not on (prefers a non-primary one).
+function externalScreen() {
+  if (!screenDetails) return null;
+  const others = screenDetails.screens.filter((s) => s !== screenDetails.currentScreen);
+  return others.find((s) => !s.isPrimary) || others[0] || null;
+}
+let fullscreenPending = false; // set once the output window is on the external display; sent when it says hello
+// Where the output window was last seen (saved by output.html): monitor position, size and whether it was fullscreen.
+function savedOutputPosition() {
+  try {
+    const p = JSON.parse(localStorage.getItem("presentation-output-pos"));
+    if (p && [p.left, p.top, p.w, p.h].every(Number.isFinite) && p.w > 0 && p.h > 0) return p;
+  } catch (err) { /* ignore */ }
+  return null;
+}
+const PRESIDER_COLS = { lib: 0.25, set: 0.25 };
+let normalCols = null;
+
+function setPresiderMode(enable) {
+  presiderMode = Boolean(enable);
+  document.body.classList.toggle("presider-mode", presiderMode);
+  const btn = $("presider-toggle");
+  if (btn) {
+    btn.classList.toggle("active", presiderMode);
+    btn.setAttribute("aria-pressed", String(presiderMode));
+  }
+  const openBtn = $("open-output");
+  if (openBtn) openBtn.disabled = presiderMode; // stays visible, but cannot be clicked
+  if (presiderMode) {
+    normalCols = { ...cols };
+    cols = { ...PRESIDER_COLS };
+    applyCols();
+  } else {
+    if (normalCols) {
+      cols = { ...normalCols };
+    } else {
+      loadCols();
+    }
+    applyCols();
+    saveCols();
+  }
+  try {
+    localStorage.setItem(PRESIDER_KEY, String(presiderMode));
+  } catch (err) { /* ignore */ }
+}
+
+function openOutput() {
+  if (presiderMode) return false;
+  const extended = window.screen.isExtended;
+  const saved = extended ? savedOutputPosition() : null; // a saved external-display position is meaningless when it is unplugged
+  // Reopen exactly where the output window was last placed. For a monitor other than this one the browser only honours
+  // the position once the window-management permission is granted, so it is also applied with moveTo below.
+  const features = saved
+    ? `popup,left=${saved.left},top=${saved.top},width=${saved.w},height=${saved.h}`
+    : "popup,width=1280,height=720";
+  // window.open must run straight from the click, before any await, or the browser blocks the popup.
+  const win = window.open("output.html", "presentation-output", features);
+  if (!win) return false; // blocked by the popup blocker
+  outputWin = win;
+  if (saved) {
+    try { win.moveTo(saved.left, saved.top); } catch (err) { console.error(err); }
+    if (saved.fs) { fullscreenPending = true; setTimeout(() => channel.postMessage({ cmd: "fullscreen" }), 300); }
+  } else if (extended) {
+    // First use: once the display list is available (this waits for the permission prompt), move the window
+    // onto the external display and tell it to go fullscreen.
+    loadScreenDetails().then(() => {
+      const target = externalScreen();
+      if (!target || win.closed) {
+        setStatus("Could not find the external display. Allow window management for this site, or drag the output window there once");
+        return;
+      }
+      win.moveTo(Math.round(target.availLeft), Math.round(target.availTop));
+      win.resizeTo(Math.round(target.availWidth), Math.round(target.availHeight));
+      fullscreenPending = true;
+      setTimeout(() => channel.postMessage({ cmd: "fullscreen" }), 300);
+    }).catch((err) => console.error(err));
+  }
+  return true;
+}
+// When an external display is attached, open the output automatically. Browsers only allow pop-ups after a click or key press,
+// so if the automatic attempt is blocked, the next click or key press anywhere in this window opens it.
+function autoOpenOnExternalDisplay() {
+  if (presiderMode || !window.screen.isExtended) return;
+  loadScreenDetails(); // asks for the permission early so the first Open output click can place the window right away
+  if (outputWin && !outputWin.closed) return;
+  if (openOutput()) return;
+  const retry = () => {
+    document.removeEventListener("pointerdown", retry, true);
+    document.removeEventListener("keydown", retry, true);
+    if (window.screen.isExtended && !(outputWin && !outputWin.closed)) openOutput();
+  };
+  document.addEventListener("pointerdown", retry, true);
+  document.addEventListener("keydown", retry, true);
+  setStatus("External display detected. Click anywhere (or press a key) to open the output on it");
+}
+window.screen.addEventListener?.("change", autoOpenOnExternalDisplay);
+$("reload").addEventListener("click", reloadSheet);
+$("open-output").addEventListener("click", openOutput);
+if ($("presider-toggle")) $("presider-toggle").addEventListener("click", () => setPresiderMode(!presiderMode));
+$("save-settings").addEventListener("click", async () => {
+  const prevId = config.sheet.id, prevGid = config.sheet.gid, prevLines = linesPerSlide;
+  const hadTitle = config.theme.showTitle;
+  const prevFolder = driveFolderId;
+  const prevSongSrc = songSource;
+  const prevAudioSrc = audioSource;
+  readSettingsForm();
+  if (prevFolder !== driveFolderId) { drivePath = []; driveLoaded = ""; $("drive-search").value = ""; }
+  if (prevAudioSrc !== audioSource) { $("drive-search").value = ""; }
+  // A different library means the old set lists no longer refer to anything in it, so clear them.
+  if (prevSongSrc !== songSource) { setlist = []; setIndex = -1; saveSetlist(); renderSetlist(); }
+  if (prevAudioSrc !== audioSource) { audioSet = []; audioIndex = -1; saveAudioSet(); renderAudioSet(); }
+  persist();
+  applyTheme(previewEl, currentTheme());
+  if (prevId !== config.sheet.id || prevGid !== config.sheet.gid || prevSongSrc !== songSource) await loadSongs();
+  if (prevLines !== linesPerSlide || hadTitle !== config.theme.showTitle) rebuildSlides(hadTitle);
+  publish();
+  setDrawer(false);
+  setStatus("Settings saved");
+  renderAudioBrowser();
+  refreshDrive(false);
+});
+
+for (const id of ["bg", "fg", "size", "auto-fit", "align", "uppercase", "show-title", "auto-play-audio"]) {
+  $(id).addEventListener("input", () => {
+    const hadTitle = config.theme.showTitle;
+    readSettingsForm();
+    if (id === "auto-play-audio") persist();
+    if (hadTitle !== config.theme.showTitle) rebuildSlides(hadTitle);
+    applyTheme(previewEl, currentTheme());
+    publish();
+  });
+}
+
+// Opens a collapsible box (if given) and puts the cursor in a field.
+function focusField(id, detailsId) {
+  if (detailsId) $(detailsId).open = true;
+  const el = $(id);
+  el.focus();
+  el.scrollIntoView({ block: "nearest" });
+}
+
+document.addEventListener("keydown", (e) => {
+  const tag = e.target.tagName;
+  const typing = tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA";
+  if (!$("drawer").hidden) return; // no shortcuts while the settings drawer is open
+  if (e.key === "Escape") {
+    if (e.defaultPrevented) return; // this Esc already closed the settings drawer
+    // Esc folds the Custom slide, Bible and Google Drive boxes, and leaves the field so the shortcut keys work again.
+    for (const id of ["custom-editor", "esv-editor", "drive-panel"]) $(id).open = false;
+    if (typing) e.target.blur();
+    return;
+  }
+  if (typing || tag === "AUDIO") return; // the audio player has its own keys
+  if (e.ctrlKey || e.metaKey || e.altKey) return; // leave browser shortcuts such as Ctrl+C and Ctrl+L alone
+  // Jump straight into a field; preventDefault stops the letter from being typed into it.
+  const jump = { a: presiderMode ? null : ["drive-search", "drive-panel"], l: ["search"], c: ["custom-title", "custom-editor"], b: ["esv-ref", "esv-editor"] }[e.key.toLowerCase()];
+  if (jump) { e.preventDefault(); focusField(jump[0], jump[1]); return; }
+  if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") { e.preventDefault(); go(1); }
+  else if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); go(-1); }
+  else if (e.key === ".") toggleBlank();
+  else if (e.key.toLowerCase() === "f") toggleLive();
+  else if (e.key.toLowerCase() === "k") sendVideo("toggle");
+  else if (e.key.toLowerCase() === "s") sendVideo("restart");
+  else if (e.key.toLowerCase() === "r") reloadSheet();
+  else if (e.key.toLowerCase() === "o") { if (!presiderMode) openOutput(); }
+  else if (e.key.toLowerCase() === "i") setDrawer(true);
+  else if (e.key.toLowerCase() === "n") goSong(1);
+  else if (e.key.toLowerCase() === "p") goSong(-1);
+});
+
+channel.onmessage = (e) => {
+  if (e.data && e.data.hello) {
+    publish();
+    if (fullscreenPending) { fullscreenPending = false; channel.postMessage({ cmd: "fullscreen" }); }
+  }
+};
+
+// ---------- Init ----------
+initLayout();
+// Keeps a connection open to the local server while this page is open. When the page is closed the server sees
+// the connection drop and shuts itself down. Only the page opened from server.py has this endpoint; elsewhere it just fails once.
+const aliveStream = location.protocol.startsWith("http") ? new EventSource("/api/alive") : null;
+(async function init() {
+  try {
+    config = await fetchJson("config.json");
+  } catch (err) {
+    console.error(err);
+    setStatus("config.json not found. Serve this folder over http (see README.md)");
+    return;
+  }
+  try {
+    const saved = loadSaved();
+    if (saved.sheet) Object.assign(config.sheet, saved.sheet);
+    if (typeof config.sheet.url === "string" && config.sheet.url.trim()) config.sheet.id = extractSheetId(config.sheet.url);
+    if (saved.theme) Object.assign(config.theme, saved.theme);
+    if (!MEDIA_ID_RE.test(config.theme.blankImage || "")) config.theme.blankImage = "";
+    if (!MEDIA_ID_RE.test(config.theme.backgroundImage || "")) config.theme.backgroundImage = "";
+    if (config.theme.backgroundDim == null) config.theme.backgroundDim = 40;
+    linesPerSlide = saved.linesPerSlide || 0;
+    songSource = saved.songSource || (config.sheet.id ? "sheet" : "local");
+    audioSource = saved.audioSource || "local";
+    autoPlayAudio = saved.autoPlayAudio === true;
+    loadSetlist();
+    loadLocalAudioList();
+    loadAudioSet();
+    loadCustoms();
+    esvKey = localStorage.getItem(ESV_KEY_STORAGE) || "";
+    driveKey = localStorage.getItem(DRIVE_KEY_STORAGE) || "";
+    driveFolderUrl = saved.drive && typeof saved.drive.url === "string" ? saved.drive.url.slice(0, 500) : "";
+    driveFolderId = saved.drive && (extractFolderId(driveFolderUrl) || extractFolderId(saved.drive.folder)) || "";
+    fillSettingsForm();
+    fillRelayForm();
+    applyTheme(previewEl, currentTheme());
+    await loadSongs();
+    publish();
+    renderAudioBrowser();
+    renderAudioSet();
+    refreshDrive(false);
+    try {
+      const savedPresider = localStorage.getItem(PRESIDER_KEY);
+      if (savedPresider === "true") setPresiderMode(true);
+    } catch (err) { /* ignore */ }
+    autoOpenOnExternalDisplay();
+  } catch (err) {
+    console.error(err);
+    setStatus(`Startup error: ${err.message}. See the browser console (F12).`);
+  }
+})();
