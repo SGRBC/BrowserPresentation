@@ -22,7 +22,6 @@
       <button id="liturgy-manage-btn" title="Manage liturgy slots template" hidden>Manage Template</button>
       <button id="presider-toggle" class="presider-btn" title="Toggle Presider mode (hide output preview and window controls for presiding)">Presider mode</button>
       <button id="reload" title="Reload songs from the Google Sheet (R key)">Reload sheet (R)</button>
-      <button id="open-output" class="primary" title="Open the audience window (O key)">Open output window (O)</button>
       <button id="menu-btn" class="burger" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="drawer" title="Settings (I key)">
         <span></span><span></span><span></span>
       </button><span class="key-hint" aria-hidden="true">(I)</span>
@@ -139,12 +138,17 @@
 
     <section class="panel" id="preview-panel">
       <header id="current-title">No song selected</header>
+      <div id="presider-font-controls" class="row" style="padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--surface); align-items: center; justify-content: space-between; gap: 8px;" hidden>
+        <span style="font-size: 12px; color: var(--muted); font-weight: bold;">Lyric Font Size:</span>
+        <div class="row" style="gap: 4px;">
+          <button id="presider-font-dec" style="padding: 2px 8px; font-size: 12px;" title="Decrease font size">-</button>
+          <span id="presider-font-val" style="font-size: 13px; font-weight: bold; min-width: 2.5em; text-align: center; display: inline-block;">14px</span>
+          <button id="presider-font-inc" style="padding: 2px 8px; font-size: 12px;" title="Increase font size">+</button>
+        </div>
+      </div>
       <div class="stage">
         <div class="controls">
-          <button id="prev">&larr; Previous</button>
-          <button id="next" class="primary">Next &rarr;</button>
-          <button id="prev-song" title="Previous song in set list">&#9664;&#9664; Song</button>
-          <button id="next-song" title="Next song in set list">Song &#9654;&#9654;</button>
+          <button id="open-output" class="primary" title="Open the audience window (O key)">Output (O)</button>
           <button id="blank" class="danger" title="Blank the output (. key)">Blank (.)</button>
           <button id="live" class="active" aria-pressed="true" title="On: the output window shows the preview. Off: the output window is blank while you keep working in the preview (F key)">Live (F)</button>
         </div>

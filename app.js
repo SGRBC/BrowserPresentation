@@ -95,6 +95,7 @@ let setlistMode = "standard"; // "standard" | "liturgy"
 let liturgyTemplate = [...DEFAULT_LITURGY_SLOTS];
 let liturgySetlist = []; // [{ slotName, song }]
 let selectedLiturgyIndex = 0; // selected slot index for insertion/clicking
+let presiderFontSize = 14; // font size of slides in presider mode
 let dragType = "";  // "setlist" | "audioset"
 let dragSourceIndex = -1;
 let dragJustEnded = false;
@@ -476,7 +477,18 @@ async function loadSongs() {
   renderSetlist();
 }
 
-function setStatus(msg) { $("status").textContent = msg; }
+function setStatus(msg) {
+  const statusEl = $("status");
+  statusEl.textContent = msg;
+  const topbar = document.querySelector(".topbar");
+  if (topbar) {
+    if (msg && msg.length > 25) {
+      topbar.classList.add("long-status");
+    } else {
+      topbar.classList.remove("long-status");
+    }
+  }
+}
 
 // ---------- Slides ----------
 // Section labels such as "Verse 1", "[Chorus]", "(Bridge)", "Refrain:" or "Chorus x2" are shown to the operator
@@ -1317,6 +1329,7 @@ function showsLastMarker(i) {
 }
 
 function renderSlideList() {
+  applyPresiderFontSize();
   const list = $("slides");
   list.replaceChildren();
   slides.forEach((slide, i) => {
@@ -2430,6 +2443,10 @@ function totalWidth() { return document.documentElement.clientWidth - 2 * HANDLE
 // Keeps every column at least MIN_COL wide (px in, px out).
 function clampPx(px) {
   const total = totalWidth();
+  if (presiderMode) {
+    const set = Math.max(MIN_COL, Math.min(px.set, total - MIN_COL));
+    return { lib: 0, set };
+  }
   const lib = Math.max(MIN_COL, Math.min(px.lib, total - 2 * MIN_COL));
   const set = Math.max(MIN_COL, Math.min(px.set, total - lib - MIN_COL));
   return { lib, set };
@@ -2568,6 +2585,44 @@ function initLiturgyListeners() {
   toggleLiturgyControls();
 }
 
+function initPresiderFontControls() {
+  try {
+    presiderFontSize = parseInt(localStorage.getItem("presentation-presider-font-size"), 10) || 14;
+  } catch {
+    presiderFontSize = 14;
+  }
+  applyPresiderFontSize();
+
+  const btnDec = $("presider-font-dec");
+  if (btnDec) {
+    btnDec.addEventListener("click", () => {
+      presiderFontSize = Math.max(10, presiderFontSize - 1);
+      localStorage.setItem("presentation-presider-font-size", String(presiderFontSize));
+      applyPresiderFontSize();
+    });
+  }
+
+  const btnInc = $("presider-font-inc");
+  if (btnInc) {
+    btnInc.addEventListener("click", () => {
+      presiderFontSize = Math.min(32, presiderFontSize + 1);
+      localStorage.setItem("presentation-presider-font-size", String(presiderFontSize));
+      applyPresiderFontSize();
+    });
+  }
+}
+
+function applyPresiderFontSize() {
+  const list = $("slides");
+  if (list) {
+    list.style.setProperty("--presider-font-size", `${presiderFontSize}px`);
+  }
+  const val = $("presider-font-val");
+  if (val) {
+    val.textContent = `${presiderFontSize}px`;
+  }
+}
+
 function initLayout() {
   loadCols();
   applyCols();
@@ -2620,8 +2675,8 @@ $("custom-save").addEventListener("click", saveCustom);
 $("custom-add").addEventListener("click", addCustomToSet);
 $("custom-clear").addEventListener("click", resetCustomForm);
 $("search").addEventListener("input", renderSongList);
-$("prev").addEventListener("click", () => go(-1));
-$("next").addEventListener("click", () => go(1));
+if ($("prev")) $("prev").addEventListener("click", () => go(-1));
+if ($("next")) $("next").addEventListener("click", () => go(1));
 $("blank").addEventListener("click", toggleBlank);
 $("live").addEventListener("click", toggleLive);
 if ($("theme-bg-file")) $("theme-bg-file").addEventListener("change", (e) => pickThemeBgImage(e.target.files[0]));
@@ -2671,8 +2726,8 @@ $("aset-next").addEventListener("click", () => goTrack(1));
 $("aset-clear").addEventListener("click", () => {
   if (audioSet.length && confirm("Clear the whole audio set list?")) { audioSet = []; audioIndex = -1; saveAudioSet(); renderAudioSet(); }
 });
-$("prev-song").addEventListener("click", () => goSong(-1));
-$("next-song").addEventListener("click", () => goSong(1));
+if ($("prev-song")) $("prev-song").addEventListener("click", () => goSong(-1));
+if ($("next-song")) $("next-song").addEventListener("click", () => goSong(1));
 $("set-clear").addEventListener("click", () => {
   if (setlistMode === "liturgy") {
     const hasSongs = liturgySetlist.some(x => x.song);
@@ -2868,7 +2923,7 @@ function savedOutputPosition() {
   } catch (err) { /* ignore */ }
   return null;
 }
-const PRESIDER_COLS = { lib: 0.15, set: 0.35 };
+const PRESIDER_COLS = { lib: 0, set: 0.35 };
 let normalCols = null;
 
 function setPresiderMode(enable) {
@@ -2879,6 +2934,9 @@ function setPresiderMode(enable) {
     btn.classList.toggle("active", presiderMode);
     btn.setAttribute("aria-pressed", String(presiderMode));
   }
+  const fontCtrl = $("presider-font-controls");
+  if (fontCtrl) fontCtrl.hidden = !presiderMode;
+
   const openBtn = $("open-output");
   if (openBtn) openBtn.disabled = presiderMode; // stays visible, but cannot be clicked
   if (presiderMode) {
@@ -3060,6 +3118,7 @@ const aliveStream = location.protocol.startsWith("http") ? new EventSource("/api
     loadAudioSet();
     loadCustoms();
     initLiturgyListeners();
+    initPresiderFontControls();
     esvKey = localStorage.getItem(ESV_KEY_STORAGE) || "";
     driveKey = localStorage.getItem(DRIVE_KEY_STORAGE) || "";
     driveFolderUrl = saved.drive && typeof saved.drive.url === "string" ? saved.drive.url.slice(0, 500) : "";

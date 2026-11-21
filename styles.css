@@ -61,8 +61,23 @@ input[type="text"], input[type="password"], input[type="search"], input[type="nu
   padding: 0 12px;
   border-bottom: 2px solid var(--brown-border);
   background: var(--surface);
+  overflow: hidden;
 }
-.topbar h1 { margin: 0 auto 0 0; font-size: 16px; }
+.topbar h1 {
+  margin: 0 auto 0 0;
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
+  min-width: 0;
+}
+.topbar.long-status h1 {
+  display: none;
+}
+.topbar.long-status #status {
+  margin-right: auto;
+}
 
 /* Burger button */
 .burger {
@@ -102,7 +117,14 @@ input[type="text"], input[type="password"], input[type="search"], input[type="nu
 .drawer header button#save-settings { padding: 4px 12px; font-size: 13px; font-weight: 600; line-height: 20px; }
 .drawer header button#menu-close { padding: 0 8px; font-size: 20px; line-height: 26px; }
 .drawer .body { flex: 1; overflow-y: auto; padding: 12px; }
-#status { color: var(--muted); font-size: 12px; }
+#status {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
 
 .panel {
   display: flex;
@@ -243,6 +265,7 @@ details.custom summary small { font-weight: 400; color: var(--muted); }
 .slide-list li:hover { border-color: var(--accent); }
 .slide-list li.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .slide-list .label { display: block; margin-bottom: 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; }
+.slide-list li { font-size: var(--presider-font-size, inherit); }
 
 .empty { color: var(--muted); padding: 12px; }
 
@@ -365,6 +388,13 @@ body.output .screen { position: fixed; inset: 0; }
 }
 body.presider-mode #open-output {
   pointer-events: none;
+}
+body.presider-mode #library-panel,
+body.presider-mode #resize-lib {
+  display: none !important;
+}
+body.presider-mode .app {
+  grid-template-columns: var(--col-set, 1fr) 6px minmax(0, 1fr) !important;
 }
 body.presider-mode #preview-panel .stage,
 body.presider-mode #audioset,
