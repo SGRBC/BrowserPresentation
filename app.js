@@ -71,6 +71,30 @@ let audioUrl = "";      // blob: / object URL of that file
 let esvPending = null; // last fetched ESV passage, not yet saved: same shape as a custom slide
 let setlist = [];   // [{ title, author, custom }] references into the song library
 let setIndex = -1;  // position in setlist of the song being shown, -1 if none
+
+const SETLIST_MODE_KEY = "presentation-setlist-mode-v1";
+const LITURGY_SETLIST_KEY = "presentation-liturgy-setlist-v1";
+const LITURGY_TEMPLATE_KEY = "presentation-liturgy-template-v1";
+const DEFAULT_LITURGY_SLOTS = [
+  "Call to Worship",
+  "Hymn #1",
+  "Reading of the Law",
+  "Hymn #2",
+  "Reading in the NT",
+  "Hymn #3",
+  "Corporate Confession",
+  "Response Hymn",
+  "Doxology",
+  "Sunday School Hymn",
+  "Lord's Table Hymn",
+  "Tinapay ng Buhay",
+  "Covenant Oath",
+  "Benediction"
+];
+let setlistMode = "standard"; // "standard" | "liturgy"
+let liturgyTemplate = [...DEFAULT_LITURGY_SLOTS];
+let liturgySetlist = []; // [{ slotName, song }]
+let selectedLiturgyIndex = 0; // selected slot index for insertion/clicking
 let dragType = "";  // "setlist" | "audioset"
 let dragSourceIndex = -1;
 let dragJustEnded = false;
@@ -502,11 +526,200 @@ function rebuildSlides(hadTitle) {
 
 // ---------- Set list ----------
 function loadSetlist() {
+  // Load mode
+  setlistMode = localStorage.getItem(SETLIST_MODE_KEY) || "standard";
+  
+  // Load standard set list
   try {
     const raw = JSON.parse(localStorage.getItem(SETLIST_KEY));
     setlist = sanitizeSetlist(raw);
   } catch {
     setlist = [];
+  }
+
+  // Load liturgy template
+  try {
+    const rawTpl = JSON.parse(localStorage.getItem(LITURGY_TEMPLATE_KEY));
+    if (Array.isArray(rawTpl) && rawTpl.every(x => typeof x === "string")) {
+      liturgyTemplate = rawTpl;
+    } else {
+      liturgyTemplate = [...DEFAULT_LITURGY_SLOTS];
+    }
+  } catch {
+    liturgyTemplate = [...DEFAULT_LITURGY_SLOTS];
+  }
+
+  // Load liturgy set list
+  try {
+    const rawLit = JSON.parse(localStorage.getItem(LITURGY_SETLIST_KEY));
+    if (Array.isArray(rawLit)) {
+      liturgySetlist = rawLit.map(x => ({
+        slotName: typeof x.slotName === "string" ? x.slotName.slice(0, 300) : "",
+        song: x.song && typeof x.song.title === "string" ? {
+          title: x.song.title.slice(0, 300),
+          author: typeof x.song.author === "string" ? x.song.author.slice(0, 300) : "",
+          custom: x.song.custom === true
+        } : null
+      }));
+    } else {
+      liturgySetlist = liturgyTemplate.map(name => ({ slotName: name, song: null }));
+    }
+  } catch {
+    liturgySetlist = liturgyTemplate.map(name => ({ slotName: name, song: null }));
+  }
+
+  // Ensure liturgySetlist matches liturgyTemplate structure
+  syncLiturgySetlist();
+}
+
+function syncLiturgySetlist() {
+  const newSetlist = [];
+  liturgyTemplate.forEach((name, i) => {
+    const existing = liturgySetlist[i];
+    if (existing && existing.slotName === name) {
+      newSetlist.push(existing);
+    } else {
+      const found = liturgySetlist.find(x => x.slotName === name);
+      if (found) {
+        newSetlist.push(found);
+      } else {
+        newSetlist.push({ slotName: name, song: null });
+      }
+    }
+  });
+  liturgySetlist = newSetlist;
+  saveLiturgySetlist();
+}
+
+function saveLiturgySetlist() {
+  localStorage.setItem(LITURGY_SETLIST_KEY, JSON.stringify(liturgySetlist));
+  localStorage.setItem(LITURGY_TEMPLATE_KEY, JSON.stringify(liturgyTemplate));
+}
+
+function saveSetlistMode() {
+  localStorage.setItem(SETLIST_MODE_KEY, setlistMode);
+}
+
+function toggleLiturgyControls() {
+  const isLiturgy = setlistMode === "liturgy";
+  if ($("liturgy-manage-btn")) $("liturgy-manage-btn").hidden = !isLiturgy;
+  if (!isLiturgy) {
+    if ($("liturgy-manager")) $("liturgy-manager").hidden = true;
+    if ($("liturgy-manage-btn")) $("liturgy-manage-btn").classList.remove("active");
+  }
+}
+
+function renderLiturgyTemplateList() {
+  const list = $("liturgy-slots-list");
+  if (!list) return;
+  list.replaceChildren();
+  liturgyTemplate.forEach((name, i) => {
+    const li = document.createElement("li");
+    li.style.padding = "4px 6px";
+    li.style.display = "flex";
+    li.style.alignItems = "center";
+    li.style.justifyContent = "space-between";
+    li.style.gap = "4px";
+
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "name";
+    nameSpan.textContent = name;
+    nameSpan.title = "Click to rename slot";
+    nameSpan.style.cursor = "pointer";
+    nameSpan.style.flex = "1";
+    nameSpan.addEventListener("click", () => {
+      const newName = prompt(`Rename slot "${name}" to:`, name);
+      if (newName && newName.trim()) {
+        renameLiturgySlot(i, newName.trim());
+      }
+    });
+    li.append(nameSpan);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.innerHTML = "&times;";
+    removeBtn.title = "Delete slot from template";
+    removeBtn.style.fontSize = "10px";
+    removeBtn.style.padding = "1px 4px";
+    removeBtn.style.cursor = "pointer";
+    removeBtn.addEventListener("click", () => {
+      if (confirm(`Remove the slot "${name}" from the liturgy template? (Assigned songs will be removed too)`)) {
+        deleteLiturgySlot(i);
+      }
+    });
+    li.append(removeBtn);
+
+    list.append(li);
+  });
+}
+
+function renameLiturgySlot(i, newName) {
+  liturgyTemplate[i] = newName;
+  if (liturgySetlist[i]) {
+    liturgySetlist[i].slotName = newName;
+  }
+  saveLiturgySetlist();
+  renderSetlist();
+  renderLiturgyTemplateList();
+}
+
+function deleteLiturgySlot(i) {
+  liturgyTemplate.splice(i, 1);
+  liturgySetlist.splice(i, 1);
+  if (selectedLiturgyIndex >= liturgyTemplate.length) {
+    selectedLiturgyIndex = Math.max(0, liturgyTemplate.length - 1);
+  }
+  if (setIndex === i) {
+    setIndex = -1;
+    song = null;
+    slides = [];
+    index = 0;
+    if ($("current-title")) $("current-title").textContent = "";
+    renderSongList();
+    renderSlideList();
+    publish();
+  } else if (setIndex > i) {
+    setIndex -= 1;
+  }
+  saveLiturgySetlist();
+  renderSetlist();
+  renderLiturgyTemplateList();
+}
+
+function addLiturgySlot() {
+  const input = $("liturgy-new-slot");
+  if (!input) return;
+  const name = input.value.trim();
+  if (!name) return;
+  if (liturgyTemplate.length >= MAX_SETLIST) {
+    setStatus("Too many slots in liturgy template");
+    return;
+  }
+  liturgyTemplate.push(name);
+  liturgySetlist.push({ slotName: name, song: null });
+  input.value = "";
+  saveLiturgySetlist();
+  renderSetlist();
+  renderLiturgyTemplateList();
+  setStatus(`Added slot "${name}" to liturgy template`);
+}
+
+function resetLiturgyTemplate() {
+  if (confirm("Reset liturgy template to the default 14 slots shown in the image? This will overwrite your custom slots structure and assignments.")) {
+    liturgyTemplate = [...DEFAULT_LITURGY_SLOTS];
+    liturgySetlist = liturgyTemplate.map(name => ({ slotName: name, song: null }));
+    selectedLiturgyIndex = 0;
+    setIndex = -1;
+    song = null;
+    slides = [];
+    index = 0;
+    if ($("current-title")) $("current-title").textContent = "";
+    saveLiturgySetlist();
+    renderSetlist();
+    renderLiturgyTemplateList();
+    renderSongList();
+    renderSlideList();
+    publish();
+    setStatus("Liturgy template reset to default structure");
   }
 }
 
@@ -534,28 +747,81 @@ function findSong(ref) {
 }
 
 function addToSetlist(s) {
-  if (setlist.length >= MAX_SETLIST) return;
-  setlist.push({ title: s.title, author: s.author || "", custom: Boolean(s.custom) });
-  saveSetlist();
-  renderSetlist();
+  if (setlistMode === "liturgy") {
+    if (!liturgySetlist.length) {
+      setStatus("No liturgy slots available. Manage template to add slots.");
+      return;
+    }
+    const idx = selectedLiturgyIndex >= 0 && selectedLiturgyIndex < liturgySetlist.length ? selectedLiturgyIndex : 0;
+    liturgySetlist[idx].song = { title: s.title, author: s.author || "", custom: Boolean(s.custom) };
+    saveLiturgySetlist();
+    
+    // Automatically present the assigned song
+    playSetlistItem(idx);
+    
+    // Advance selected index to next slot
+    selectedLiturgyIndex = (idx + 1) % liturgySetlist.length;
+    renderSetlist();
+  } else {
+    if (setlist.length >= MAX_SETLIST) return;
+    setlist.push({ title: s.title, author: s.author || "", custom: Boolean(s.custom) });
+    saveSetlist();
+    renderSetlist();
+  }
 }
 
 function removeFromSetlist(i) {
-  setlist.splice(i, 1);
-  if (setIndex === i) setIndex = -1;
-  else if (setIndex > i) setIndex -= 1;
-  saveSetlist();
-  renderSetlist();
+  if (setlistMode === "liturgy") {
+    if (liturgySetlist[i]) {
+      liturgySetlist[i].song = null;
+      if (setIndex === i) {
+        setIndex = -1;
+        song = null;
+        slides = [];
+        index = 0;
+        if ($("current-title")) $("current-title").textContent = "";
+        renderSongList();
+        renderSlideList();
+        publish();
+      }
+      saveLiturgySetlist();
+      renderSetlist();
+    }
+  } else {
+    setlist.splice(i, 1);
+    if (setIndex === i) setIndex = -1;
+    else if (setIndex > i) setIndex -= 1;
+    saveSetlist();
+    renderSetlist();
+  }
 }
 
 function reorderSetlist(from, to) {
-  const [item] = setlist.splice(from, 1);
-  setlist.splice(to, 0, item);
-  if (setIndex === from) setIndex = to;
-  else if (from < setIndex && to >= setIndex) setIndex -= 1;
-  else if (from > setIndex && to <= setIndex) setIndex += 1;
-  saveSetlist();
-  renderSetlist();
+  if (setlistMode === "liturgy") {
+    const [item] = liturgySetlist.splice(from, 1);
+    liturgySetlist.splice(to, 0, item);
+    // Keep template in sync with slot order
+    liturgyTemplate = liturgySetlist.map(x => x.slotName);
+    if (setIndex === from) setIndex = to;
+    else if (from < setIndex && to >= setIndex) setIndex -= 1;
+    else if (from > setIndex && to <= setIndex) setIndex += 1;
+
+    if (selectedLiturgyIndex === from) selectedLiturgyIndex = to;
+    else if (from < selectedLiturgyIndex && to >= selectedLiturgyIndex) selectedLiturgyIndex -= 1;
+    else if (from > selectedLiturgyIndex && to <= selectedLiturgyIndex) selectedLiturgyIndex += 1;
+
+    saveLiturgySetlist();
+    renderSetlist();
+    renderLiturgyTemplateList();
+  } else {
+    const [item] = setlist.splice(from, 1);
+    setlist.splice(to, 0, item);
+    if (setIndex === from) setIndex = to;
+    else if (from < setIndex && to >= setIndex) setIndex -= 1;
+    else if (from > setIndex && to <= setIndex) setIndex += 1;
+    saveSetlist();
+    renderSetlist();
+  }
 }
 
 function makeDraggable(li, type, i, getLength, onReorder) {
@@ -605,56 +871,135 @@ function makeDraggable(li, type, i, getLength, onReorder) {
 }
 
 function playSetlistItem(i, lastSlide = false) {
-  const s = findSong(setlist[i]);
-  if (!s) return false;
-  selectSong(s, i);
-  if (lastSlide) { index = Math.max(0, slides.length - 1); renderSlideList(); publish(); }
-  return true;
+  if (setlistMode === "liturgy") {
+    const litItem = liturgySetlist[i];
+    if (!litItem || !litItem.song) return false;
+    const s = findSong(litItem.song);
+    if (!s) return false;
+    selectSong(s, i);
+    if (lastSlide) { index = Math.max(0, slides.length - 1); renderSlideList(); publish(); }
+    return true;
+  } else {
+    const s = findSong(setlist[i]);
+    if (!s) return false;
+    selectSong(s, i);
+    if (lastSlide) { index = Math.max(0, slides.length - 1); renderSlideList(); publish(); }
+    return true;
+  }
 }
 
 // Move to the next/previous playable song in the set list.
 function goSong(delta, lastSlide = false) {
-  if (!setlist.length) return;
-  let i = setIndex < 0 ? (delta > 0 ? -1 : setlist.length) : setIndex;
-  for (i += delta; i >= 0 && i < setlist.length; i += delta) {
-    if (playSetlistItem(i, lastSlide)) return;
+  if (setlistMode === "liturgy") {
+    if (!liturgySetlist.length) return;
+    let i = setIndex < 0 ? (delta > 0 ? -1 : liturgySetlist.length) : setIndex;
+    for (i += delta; i >= 0 && i < liturgySetlist.length; i += delta) {
+      if (playSetlistItem(i, lastSlide)) return;
+    }
+  } else {
+    if (!setlist.length) return;
+    let i = setIndex < 0 ? (delta > 0 ? -1 : setlist.length) : setIndex;
+    for (i += delta; i >= 0 && i < setlist.length; i += delta) {
+      if (playSetlistItem(i, lastSlide)) return;
+    }
   }
 }
 
 function renderSetlist() {
   const list = $("setlist");
   list.replaceChildren();
-  $("set-count").textContent = setlist.length ? `(${setlist.length})` : "";
-  if (!setlist.length) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "Empty. Press + on a song to add it.";
-    list.append(li);
-    return;
+
+  if (setlistMode === "liturgy") {
+    $("set-count").textContent = liturgySetlist.length ? `(${liturgySetlist.filter(x => x.song).length}/${liturgySetlist.length})` : "";
+    if (!liturgySetlist.length) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "No liturgy slots. Manage template to add slots.";
+      list.append(li);
+      return;
+    }
+
+    liturgySetlist.forEach((item, i) => {
+      const li = document.createElement("li");
+      li.classList.add("liturgy-slot-item");
+      if (i === selectedLiturgyIndex) li.classList.add("selected-liturgy-slot");
+      if (i === setIndex) li.classList.add("active");
+
+      const slotLabel = document.createElement("strong");
+      slotLabel.className = "liturgy-slot-name";
+      slotLabel.textContent = `${item.slotName}: `;
+      li.append(slotLabel);
+
+      if (item.song) {
+        const found = findSong(item.song);
+        if (!found) li.classList.add("missing");
+
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = found ? item.song.title : `${item.song.title} (not found)`;
+        li.append(name);
+
+        const mk = (label, title, fn) => {
+          const b = document.createElement("button");
+          b.textContent = label;
+          b.title = title;
+          b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+          return b;
+        };
+        li.append(mk("\u00D7", "Clear song from this slot", () => removeFromSetlist(i)));
+      } else {
+        const emptyLabel = document.createElement("span");
+        emptyLabel.className = "empty-slot-label";
+        emptyLabel.textContent = "[Choose slot & click + on song to insert]";
+        li.append(emptyLabel);
+      }
+
+      makeDraggable(li, "setlist", i, () => liturgySetlist.length, reorderSetlist);
+
+      li.addEventListener("click", () => {
+        if (!dragJustEnded) {
+          selectedLiturgyIndex = i;
+          renderSetlist();
+          if (item.song) {
+            playSetlistItem(i);
+          }
+        }
+      });
+      list.append(li);
+    });
+  } else {
+    $("set-count").textContent = setlist.length ? `(${setlist.length})` : "";
+    if (!setlist.length) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "Empty. Press + on a song to add it.";
+      list.append(li);
+      return;
+    }
+    setlist.forEach((ref, i) => {
+      const li = document.createElement("li");
+      const found = findSong(ref);
+      if (!found) li.classList.add("missing");
+      if (i === setIndex) li.classList.add("active");
+
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = found ? ref.title : `${ref.title} (not found)`;
+      li.append(name);
+
+      const mk = (label, title, fn) => {
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.title = title;
+        b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+        return b;
+      };
+      li.append(mk("\u00D7", "Remove from set list", () => removeFromSetlist(i)));
+      makeDraggable(li, "setlist", i, () => setlist.length, reorderSetlist);
+      li.addEventListener("click", () => { if (!dragJustEnded) playSetlistItem(i); });
+      list.append(li);
+    });
   }
-  setlist.forEach((ref, i) => {
-    const li = document.createElement("li");
-    const found = findSong(ref);
-    if (!found) li.classList.add("missing");
-    if (i === setIndex) li.classList.add("active");
-
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = found ? ref.title : `${ref.title} (not found)`;
-    li.append(name);
-
-    const mk = (label, title, fn) => {
-      const b = document.createElement("button");
-      b.textContent = label;
-      b.title = title;
-      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
-      return b;
-    };
-    li.append(mk("\u00D7", "Remove from set list", () => removeFromSetlist(i)));
-    makeDraggable(li, "setlist", i, () => setlist.length, reorderSetlist);
-    li.addEventListener("click", () => { if (!dragJustEnded) playSetlistItem(i); });
-    list.append(li);
-  });
 }
 
 // Local date and time safe for file names, e.g. 2026-11-09_16-30-05.
@@ -701,21 +1046,34 @@ async function customForExport(c) {
 
 async function exportSetlist() {
   try {
-    setStatus("Preparing set listâ€¦");
-    const titles = [...new Set(setlist.filter((x) => x.custom).map((x) => x.title))];
+    setStatus("Preparing set list…");
+    const isLit = setlistMode === "liturgy";
+    const listToExport = isLit ? liturgySetlist.filter(x => x.song).map(x => x.song) : setlist;
+    const titles = [...new Set(listToExport.filter((x) => x.custom).map((x) => x.title))];
     const exported = [];
     for (const title of titles) {
       const c = customs.find((x) => x.title === title);
       if (c) exported.push(await customForExport(c));
     }
-    const blob = new Blob([JSON.stringify({ setlist, customs: exported }, null, 2)], { type: "application/json" });
+    
+    const payload = {
+      setlistMode,
+      customs: exported
+    };
+    if (isLit) {
+      payload.liturgySetlist = liturgySetlist;
+    } else {
+      payload.setlist = setlist;
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `setlist_${fileStamp()}.json`;
+    a.download = `${isLit ? "liturgy_setlist" : "setlist"}_${fileStamp()}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setStatus(`Exported set list${exported.length ? ` with ${exported.length} custom slide${exported.length !== 1 ? "s" : ""}` : ""}`);
+    setStatus(`Exported ${isLit ? "liturgy " : ""}set list${exported.length ? ` with ${exported.length} custom slide${exported.length !== 1 ? "s" : ""}` : ""}`);
   } catch (err) {
     console.error(err);
     setStatus("Could not export set list");
@@ -762,18 +1120,59 @@ async function importSetlist(file) {
   if (!file || file.size > MAX_SETLIST_FILE) { setStatus("Set list file is invalid or too large"); return; }
   try {
     const data = JSON.parse(await file.text());
-    const items = sanitizeSetlist(Array.isArray(data) ? data : data.setlist);
-    if (!items.length) throw new Error("empty");
+    
+    const isLiturgy = data.setlistMode === "liturgy" || (data.liturgySetlist && !data.setlist);
     const customCount = Array.isArray(data) ? 0 : await importCustoms(data.customs);
-    setlist = items;
-    setIndex = -1;
-    saveSetlist();
+    
+    if (isLiturgy) {
+      const rawLit = data.liturgySetlist;
+      if (!Array.isArray(rawLit) || !rawLit.length) throw new Error("empty liturgy");
+      
+      liturgySetlist = rawLit.map(x => ({
+        slotName: typeof x.slotName === "string" ? x.slotName.slice(0, 300) : "Slot",
+        song: x.song && typeof x.song.title === "string" ? {
+          title: x.song.title.slice(0, 300),
+          author: typeof x.song.author === "string" ? x.song.author.slice(0, 300) : "",
+          custom: x.song.custom === true
+        } : null
+      }));
+      
+      liturgyTemplate = liturgySetlist.map(x => x.slotName);
+      selectedLiturgyIndex = 0;
+      setIndex = -1;
+      setlistMode = "liturgy";
+      
+      saveLiturgySetlist();
+      saveSetlistMode();
+      
+      if ($("setlist-mode")) $("setlist-mode").value = "liturgy";
+      toggleLiturgyControls();
+    } else {
+      const items = sanitizeSetlist(Array.isArray(data) ? data : data.setlist);
+      if (!items.length) throw new Error("empty");
+      setlist = items;
+      setIndex = -1;
+      setlistMode = "standard";
+      
+      saveSetlist();
+      saveSetlistMode();
+      
+      if ($("setlist-mode")) $("setlist-mode").value = "standard";
+      toggleLiturgyControls();
+    }
+    
+    // Clear the audio set list when a set list is imported
+    audioSet = [];
+    audioIndex = -1;
+    saveAudioSet();
+    renderAudioSet();
+    
     renderSetlist();
-    // The audio set list is not part of a set list file: any "audioSet" in an older file is ignored, and the
-    // current audio set list is left as it is.
+    
     const customMsg = customCount ? `, ${customCount} custom slide${customCount !== 1 ? "s" : ""} saved to the library` : "";
-    setStatus(`Imported ${items.length} song${items.length !== 1 ? "s" : ""}${customMsg} into the set list`);
-  } catch {
+    setStatus(`Imported ${isLiturgy ? "liturgy " : ""}set list${customMsg}`);
+  } catch (err) {
+    console.error(err);
     setStatus("Could not read set list file");
   }
 }
@@ -2107,6 +2506,53 @@ function setupResizer(handle, key) {
   });
 }
 
+function initLiturgyListeners() {
+  const modeSelect = $("setlist-mode");
+  if (modeSelect) {
+    modeSelect.value = setlistMode;
+    modeSelect.addEventListener("change", () => {
+      setlistMode = modeSelect.value;
+      saveSetlistMode();
+      toggleLiturgyControls();
+      renderSetlist();
+    });
+  }
+
+  const manageBtn = $("liturgy-manage-btn");
+  if (manageBtn) {
+    manageBtn.addEventListener("click", () => {
+      const manager = $("liturgy-manager");
+      if (manager) {
+        manager.hidden = !manager.hidden;
+        manageBtn.classList.toggle("active", !manager.hidden);
+        if (!manager.hidden) {
+          renderLiturgyTemplateList();
+        }
+      }
+    });
+  }
+
+  const addSlotBtn = $("liturgy-add-slot-btn");
+  if (addSlotBtn) {
+    addSlotBtn.addEventListener("click", addLiturgySlot);
+  }
+
+  const newSlotInput = $("liturgy-new-slot");
+  if (newSlotInput) {
+    newSlotInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addLiturgySlot();
+    });
+  }
+
+  const resetBtn = $("liturgy-reset-btn");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", resetLiturgyTemplate);
+  }
+
+  // Initial setup of controls visibility
+  toggleLiturgyControls();
+}
+
 function initLayout() {
   loadCols();
   applyCols();
@@ -2213,8 +2659,26 @@ $("aset-clear").addEventListener("click", () => {
 $("prev-song").addEventListener("click", () => goSong(-1));
 $("next-song").addEventListener("click", () => goSong(1));
 $("set-clear").addEventListener("click", () => {
-  if (setlist.length && confirm("Clear the whole set list?")) {
-    setlist = []; setIndex = -1; saveSetlist(); renderSetlist();
+  if (setlistMode === "liturgy") {
+    const hasSongs = liturgySetlist.some(x => x.song);
+    if (hasSongs && confirm("Clear all assigned songs from the liturgy set list slots?")) {
+      liturgySetlist.forEach(x => { x.song = null; });
+      setIndex = -1;
+      song = null;
+      slides = [];
+      index = 0;
+      if ($("current-title")) $("current-title").textContent = "";
+      saveLiturgySetlist();
+      renderSetlist();
+      renderSongList();
+      renderSlideList();
+      publish();
+      setStatus("Cleared liturgy assignments");
+    }
+  } else {
+    if (setlist.length && confirm("Clear the whole set list?")) {
+      setlist = []; setIndex = -1; saveSetlist(); renderSetlist();
+    }
   }
 });
 $("set-export").addEventListener("click", exportSetlist);
@@ -2580,6 +3044,7 @@ const aliveStream = location.protocol.startsWith("http") ? new EventSource("/api
     loadLocalAudioList();
     loadAudioSet();
     loadCustoms();
+    initLiturgyListeners();
     esvKey = localStorage.getItem(ESV_KEY_STORAGE) || "";
     driveKey = localStorage.getItem(DRIVE_KEY_STORAGE) || "";
     driveFolderUrl = saved.drive && typeof saved.drive.url === "string" ? saved.drive.url.slice(0, 500) : "";

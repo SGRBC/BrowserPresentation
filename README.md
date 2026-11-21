@@ -153,7 +153,7 @@ Each slide ends with the reference and "(ESV)". Passages are saved locally, so t
 - Drag an entry to reorder the set list, and use the **×** button to remove one. Click an entry to show that song.
 - The output window follows the set list only: clicking an item in the library does not change the output. Add songs with **+** or by double-clicking them, then click them in the set list to display them. (The **Show now** buttons in the custom slide and Bible editors are explicit exceptions: they display immediately.)
 - Pressing next on the last slide of a set list song moves to the first slide of the next song; pressing previous on a first slide goes back to the previous song's last slide.
-- **Export** downloads `setlist_<date>_<time>.json` (for example `setlist_2026-11-09_16-30-05.json`); **Import** loads one. Entries are matched to songs by title and author, so a song renamed in the sheet shows as "(not found)" and is skipped. The audio set list is not exported or imported (importing a file leaves it as it is).
+- **Export** downloads `setlist_<date>_<time>.json` (for example `setlist_2026-11-09_16-30-05.json`); **Import** loads one. Entries are matched to songs by title and author, so a song renamed in the sheet shows as "(not found)" and is skipped. The audio set list is not exported or imported (importing a file clears the audio set list).
 - The set list is saved in browser localStorage.
 
 ## Layout

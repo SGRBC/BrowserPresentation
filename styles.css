@@ -414,3 +414,44 @@ body.client .client-stage .screen:fullscreen { width: 100%; height: 100%; aspect
   background: var(--danger); color: #fff; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
   pointer-events: none;
 }
+
+/* ---------- Liturgy Mode Styles ---------- */
+.set-list li.liturgy-slot-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.set-list li.selected-liturgy-slot {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
+.set-list li.selected-liturgy-slot.active {
+  outline: 2px solid #fff;
+}
+.liturgy-slot-name {
+  font-weight: bold;
+  color: var(--text);
+  margin-right: 4px;
+}
+.set-list li.active .liturgy-slot-name {
+  color: #fff;
+}
+.empty-slot-label {
+  color: var(--muted);
+  font-style: italic;
+  font-size: 0.9em;
+}
+.set-list li.active .empty-slot-label {
+  color: rgba(255, 255, 255, 0.7);
+}
+#liturgy-slots-list li {
+  border-bottom: 1px solid var(--border);
+}
+#liturgy-slots-list li:last-child {
+  border-bottom: none;
+}
+button.active {
+  background: var(--accent) !important;
+  color: #fff !important;
+  border-color: var(--accent) !important;
+}
