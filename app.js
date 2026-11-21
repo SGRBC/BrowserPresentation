@@ -86,6 +86,7 @@ const DEFAULT_LITURGY_SLOTS = [
   "Response Hymn",
   "Doxology",
   "Sunday School Hymn",
+  "Sunday School Presentation",
   "Lord's Table Hymn",
   "Tinapay ng Buhay",
   "Covenant Oath",
@@ -621,6 +622,26 @@ function toggleLiturgyControls() {
   }
 }
 
+function reorderLiturgyTemplate(from, to) {
+  const [name] = liturgyTemplate.splice(from, 1);
+  liturgyTemplate.splice(to, 0, name);
+
+  const [item] = liturgySetlist.splice(from, 1);
+  liturgySetlist.splice(to, 0, item);
+
+  if (setIndex === from) setIndex = to;
+  else if (from < setIndex && to >= setIndex) setIndex -= 1;
+  else if (from > setIndex && to <= setIndex) setIndex += 1;
+
+  if (selectedLiturgyIndex === from) selectedLiturgyIndex = to;
+  else if (from < selectedLiturgyIndex && to >= selectedLiturgyIndex) selectedLiturgyIndex -= 1;
+  else if (from > selectedLiturgyIndex && to <= selectedLiturgyIndex) selectedLiturgyIndex += 1;
+
+  saveLiturgySetlist();
+  renderSetlist();
+  renderLiturgyTemplateList();
+}
+
 function renderLiturgyTemplateList() {
   const list = $("liturgy-slots-list");
   if (!list) return;
@@ -660,6 +681,7 @@ function renderLiturgyTemplateList() {
     });
     li.append(removeBtn);
 
+    makeDraggable(li, "liturgy-template", i, () => liturgyTemplate.length, reorderLiturgyTemplate);
     list.append(li);
   });
 }
@@ -1345,8 +1367,41 @@ function renderSlideList() {
       tag.textContent = "Last slide";
       label.append(tag);
     }
-    const fallback = slide.video ? "(video)" : slide.image ? "(picture)" : "(image only)";
-    li.append(label, document.createTextNode(slide.text || fallback));
+    li.append(label);
+
+    if (slide.text) {
+      const textDiv = document.createElement("div");
+      textDiv.textContent = slide.text;
+      textDiv.style.marginTop = "4px";
+      li.append(textDiv);
+    }
+
+    if (slide.image) {
+      const img = document.createElement("img");
+      img.className = "slide-preview-thumb";
+      img.style.display = "block";
+      img.style.maxWidth = "100%";
+      img.style.maxHeight = "120px";
+      img.style.marginTop = "6px";
+      img.style.borderRadius = "4px";
+      img.style.border = "1px solid var(--border)";
+      img.style.objectFit = "contain";
+      img.style.background = "#000";
+
+      getMediaUrl(slide.image).then((url) => {
+        if (url) img.src = url;
+      }).catch(console.error);
+
+      li.append(img);
+    } else if (!slide.text) {
+      const fallback = slide.video ? "(video)" : "(image only)";
+      const fallbackDiv = document.createElement("div");
+      fallbackDiv.textContent = fallback;
+      fallbackDiv.style.marginTop = "4px";
+      fallbackDiv.style.color = "var(--muted)";
+      li.append(fallbackDiv);
+    }
+
     li.addEventListener("click", () => { index = i; blank = false; renderSlideList(); publish(); maybeAutoPlayAudio(); });
     list.append(li);
   });
