@@ -1406,7 +1406,7 @@ function renderSlideList() {
     list.append(li);
   });
   const active = list.querySelector(".active");
-  if (active) active.scrollIntoView({ block: "nearest" });
+  if (active) active.scrollIntoView({ block: "center" });
 }
 
 function currentState() {
@@ -2734,6 +2734,15 @@ if ($("prev")) $("prev").addEventListener("click", () => go(-1));
 if ($("next")) $("next").addEventListener("click", () => go(1));
 $("blank").addEventListener("click", toggleBlank);
 $("live").addEventListener("click", toggleLive);
+$("preview").addEventListener("click", () => {
+  const list = $("slides");
+  if (list) {
+    const active = list.querySelector(".active");
+    if (active) {
+      active.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
+});
 if ($("theme-bg-file")) $("theme-bg-file").addEventListener("change", (e) => pickThemeBgImage(e.target.files[0]));
 if ($("theme-bg-clear")) $("theme-bg-clear").addEventListener("click", clearThemeBgImage);
 if ($("theme-bg-dim")) {
