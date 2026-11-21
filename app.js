@@ -1380,8 +1380,8 @@ function renderSlideList() {
       const img = document.createElement("img");
       img.className = "slide-preview-thumb";
       img.style.display = "block";
-      img.style.maxWidth = "100%";
-      img.style.maxHeight = "120px";
+      img.style.width = "100%";
+      img.style.height = "auto";
       img.style.marginTop = "6px";
       img.style.borderRadius = "4px";
       img.style.border = "1px solid var(--border)";
