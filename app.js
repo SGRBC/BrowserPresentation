@@ -1216,18 +1216,24 @@ function maybeAutoPlayAudio() {
     return top;
   };
   const inSet = best(audioSet);
-  let i = inSet ? audioSet.indexOf(inSet) : -1;
-  if (i < 0) {
+  let trackToPlay = inSet;
+  if (!trackToPlay) {
     const pool = audioSource === "local"
       ? localAudioTracks.map((t) => ({ id: t.id, name: t.name, local: true }))
       : driveItems.filter((it) => it.kind !== "folder");
     const found = best(pool);
-    if (!found) { setStatus(`Auto-play: no audio track matches "${song.title}"`); return; }
-    if (audioSet.length >= MAX_SETLIST) return;
-    addToAudioSet(found);
-    i = audioSet.length - 1;
+    if (found) {
+      trackToPlay = found;
+    }
   }
-  playAudioAt(i);
+  if (!trackToPlay) { setStatus(`Auto-play: no audio track matches "${song.title}"`); return; }
+
+  // Clear previous entries so it doesn't expand, and only show the currently playing song in the audio set list
+  audioSet = [{ id: trackToPlay.id, name: trackToPlay.name, local: Boolean(trackToPlay.local || MEDIA_ID_RE.test(trackToPlay.id)) }];
+  audioIndex = 0;
+  saveAudioSet();
+  renderAudioSet();
+  playAudioAt(0);
 }
 
 function go(delta) {
@@ -1249,6 +1255,15 @@ function toggleBlank() {
 }
 
 // ---------- Rendering (operator) ----------
+function addLibrarySongToSet(s) {
+  addToSetlist(s);
+  const searchInput = $("search");
+  if (searchInput && searchInput.value.trim()) {
+    searchInput.value = "";
+    renderSongList();
+  }
+}
+
 function renderSongList() {
   const q = $("search").value.trim().toLowerCase();
   const list = $("songs");
@@ -1288,10 +1303,10 @@ function renderSongList() {
         mk("add", "\u00D7", "Delete custom slide", () => deleteCustom(s)),
       );
     }
-    li.append(mk("add", "+", "Add to set list", () => addToSetlist(s)));
+    li.append(mk("add", "+", "Add to set list", () => addLibrarySongToSet(s)));
     if (s === song) li.classList.add("active");
     // The library never drives the output; only set list items do. Double-click adds to the set list.
-    li.addEventListener("dblclick", (e) => { if (!e.target.closest("button")) addToSetlist(s); });
+    li.addEventListener("dblclick", (e) => { if (!e.target.closest("button")) addLibrarySongToSet(s); });
     list.append(li);
   }
 }
@@ -2403,11 +2418,11 @@ function storeEsv() {
 
 // ---------- Resizable columns ----------
 // Column widths are stored as fractions of the window width (library and set list; the preview takes the
-// rest), so the layout scales with the window. By default each of the three columns is 1/3.
+// rest), so the layout scales with the window. By default, the Library takes 20%, Set list takes 40%, and Preview takes 40%.
 const LAYOUT_KEY = "presentation-layout-v2";
 const MIN_COL = 160;      // narrowest column in px
 const HANDLE_W = 6;
-const DEFAULT_COLS = { lib: 1 / 3, set: 1 / 3 };
+const DEFAULT_COLS = { lib: 0.2, set: 0.4 };
 let cols = { ...DEFAULT_COLS };
 
 function totalWidth() { return document.documentElement.clientWidth - 2 * HANDLE_W; }
@@ -2853,7 +2868,7 @@ function savedOutputPosition() {
   } catch (err) { /* ignore */ }
   return null;
 }
-const PRESIDER_COLS = { lib: 0.25, set: 0.25 };
+const PRESIDER_COLS = { lib: 0.15, set: 0.35 };
 let normalCols = null;
 
 function setPresiderMode(enable) {
