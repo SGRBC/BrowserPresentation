@@ -2951,6 +2951,11 @@ function setPresiderMode(enable) {
     }
     applyCols();
     saveCols();
+
+    // Revert preview lyric size to default (14px) when disabling presider mode
+    presiderFontSize = 14;
+    localStorage.removeItem("presentation-presider-font-size");
+    applyPresiderFontSize();
   }
   try {
     localStorage.setItem(PRESIDER_KEY, String(presiderMode));
