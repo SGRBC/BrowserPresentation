@@ -2923,7 +2923,7 @@ function savedOutputPosition() {
   } catch (err) { /* ignore */ }
   return null;
 }
-const PRESIDER_COLS = { lib: 0, set: 0.35 };
+const PRESIDER_COLS = { lib: 0, set: 0.5 };
 let normalCols = null;
 
 function setPresiderMode(enable) {

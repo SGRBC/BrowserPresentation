@@ -160,7 +160,7 @@ Each slide ends with the reference and "(ESV)". Passages are saved locally, so t
 
 Three columns, separated by draggable borders: drag a border left or right to resize the columns (double-click it to reset, or focus it and use the arrow keys, Shift for bigger steps, Home to reset). Sizes are remembered in this browser. The columns are: the **Library** (songs, with the **Custom slide** and **Bible verses** editors underneath) on the left, the **Set list** (with the **Audio set list** and the **Google Drive audio** browser underneath) in the middle, and the controls, preview and slide list for the current song on the right.
 
-**Presider mode:** Toggleable via the **Presider mode** button in the top bar. In Presider mode, the output preview screen, stage controls, "Open output window" button, audio set list, and audio source browser are hidden, and automated audio auto-play is disabled. The column layout dynamically adjusts so the lyrics/verses preview occupies 50% of the window width, while the library column occupies 15% and the set list column occupies 35%.
+**Presider mode:** Toggleable via the **Presider mode** button in the top bar. In Presider mode, the output preview screen, stage controls, "Open output window" button, audio set list, and audio source browser are hidden, and automated audio auto-play is disabled. The column layout dynamically adjusts so the set list and lyrics/verses preview columns occupy 50% of the window width each, while the library column is hidden.
 
 ## Settings
 
