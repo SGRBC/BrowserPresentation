@@ -1382,11 +1382,18 @@ function renderSlideList() {
       img.style.display = "block";
       img.style.width = "100%";
       img.style.height = "auto";
+      img.style.aspectRatio = "16 / 9";
       img.style.marginTop = "6px";
       img.style.borderRadius = "4px";
       img.style.border = "1px solid var(--border)";
       img.style.objectFit = "contain";
       img.style.background = "#000";
+
+      if (i === index) {
+        img.onload = () => {
+          li.scrollIntoView({ block: "center" });
+        };
+      }
 
       getMediaUrl(slide.image).then((url) => {
         if (url) img.src = url;
