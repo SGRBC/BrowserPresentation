@@ -2964,9 +2964,10 @@ function applySettingsText(text) {
 }
 $("import-settings").addEventListener("click", () => $("settings-file").click());
 $("import-settings-drive").addEventListener("click", importSettingsFromDrive);
-$("settings-file").addEventListener("change", (e) => {
-  importSettings(e.target.files[0]);
-  e.target.value = "";
+$("settings-file").addEventListener("change", async (e) => {
+  const input = e.target;
+  // Read the file before clearing the input: on Android the file becomes unreadable once the input is reset.
+  try { await importSettings(input.files[0]); } finally { input.value = ""; }
 });
 async function reloadSheet() { readSettingsForm(); await loadSongs(); }
 // Opens the output window. When a second display (e.g. HDMI) is attached, the window is opened on that display and
