@@ -207,7 +207,7 @@ function renderLocalSongsInfo() {
 
 async function importLocalSongsFile(file) {
   if (!file) return;
-  setStatus(`Importing songs from ${file.name}â€¦`);
+  setStatus(`Importing songs from ${file.name}\u2026`);
   try {
     const text = await file.text();
     let imported = [];
@@ -276,7 +276,7 @@ async function importLocalAudioFiles(fileList) {
   );
   if (!files.length) { setStatus("No audio files (MP3, WAV, OGG, M4A, FLAC) found in selection"); return; }
 
-  setStatus(`Adding ${files.length} audio file${files.length === 1 ? "" : "s"} to local libraryâ€¦`);
+  setStatus(`Adding ${files.length} audio file${files.length === 1 ? "" : "s"} to local library\u2026`);
   let added = 0;
   for (const f of files) {
     try {
@@ -431,7 +431,7 @@ async function loadFromSheet() {
 }
 
 async function loadSongs() {
-  setStatus("Loading songsâ€¦");
+  setStatus("Loading songs\u2026");
   try {
     if (songSource === "local") {
       const local = loadSavedLocalSongs();
@@ -527,7 +527,7 @@ function rebuildSlides(hadTitle) {
 // ---------- Set list ----------
 function loadSetlist() {
   // Load mode
-  setlistMode = localStorage.getItem(SETLIST_MODE_KEY) || "standard";
+  setlistMode = localStorage.getItem(SETLIST_MODE_KEY) || "liturgy";
   
   // Load standard set list
   try {
@@ -1183,7 +1183,7 @@ function selectSong(s, setPos = -1) {
   slides = buildSlides(s);
   index = 0;
   blank = false;
-  $("current-title").textContent = s.author ? `${s.title} â€” ${s.author}` : s.title;
+  $("current-title").textContent = s.author ? `${s.title} \u2014 ${s.author}` : s.title;
   renderSongList();
   renderSetlist();
   renderSlideList();
@@ -2025,7 +2025,7 @@ async function importPresentation(file) {
   importing = true;
   const created = [];
   try {
-    setStatus(isPdf ? `Reading ${file.name}â€¦` : `Exporting slides from ${file.name} as imagesâ€¦`);
+    setStatus(isPdf ? `Reading ${file.name}\u2026` : `Exporting slides from ${file.name} as images\u2026`);
     let deck = [];
     let convertedOnServer = false;
 
@@ -2037,7 +2037,7 @@ async function importPresentation(file) {
         const id = await putMedia(blob);
         created.push(id);
         deck.push({ text: "", image: id });
-      }, (done, total) => setStatus(`Converting ${file.name}: page ${done} of ${total}â€¦`));
+      }, (done, total) => setStatus(`Converting ${file.name}: page ${done} of ${total}\u2026`));
       convertedOnServer = true; // skips the PowerPoint/LibreOffice conversion below
     }
 
@@ -2053,7 +2053,7 @@ async function importPresentation(file) {
       if (res.ok) {
         const data = await res.json();
         if (data.slides && data.slides.length) {
-          setStatus(`Saving ${data.slides.length} slide imagesâ€¦`);
+          setStatus(`Saving ${data.slides.length} slide images\u2026`);
           for (const dataUrl of data.slides.slice(0, MAX_DECK_SLIDES)) {
             const blob = await (await fetch(dataUrl)).blob();
             const id = await putMedia(blob);
@@ -2071,7 +2071,7 @@ async function importPresentation(file) {
     }
 
     if (!convertedOnServer) {
-      setStatus(`Reading ${file.name}â€¦`);
+      setStatus(`Reading ${file.name}\u2026`);
       const { slides: deckSlides } = await readPresentation(file);
       for (const s of deckSlides.slice(0, MAX_DECK_SLIDES)) {
         let image = "";
@@ -2144,7 +2144,7 @@ async function pickMedia(file) {
   const created = []; // ids stored by this import, removed again if it fails
   try {
     if (file.size > MAX_VIDEO_FILE) throw new ImportError("Video is too large (2 GB maximum)");
-    setStatus(`Importing video ${file.name}â€¦`);
+    setStatus(`Importing video ${file.name}\u2026`);
     const id = await putMedia(file);
     created.push(id);
     // Make sure this browser can actually play it (e.g. some .mov/.mkv codecs cannot).
@@ -2343,7 +2343,7 @@ async function fetchEsv() {
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
-  setStatus("Fetching passageâ€¦");
+  setStatus("Fetching passage\u2026");
   try {
     // Preferred: the local server's proxy (server.py). When the app is served by something else (a plain static
     // server or GitHub Pages) there is no proxy and the reply is not JSON, so ask the ESV API directly (it allows CORS).
@@ -2761,7 +2761,7 @@ async function importSettingsFromDrive() {
   if (!fileId) { setStatus("Paste the Google Drive link of the settings file first"); return; }
   const key = $("drive-settings-key").value.trim() || $("drive-key").value.trim() || driveKey;
   if (!key) { setStatus("Add a Google API key (above, or in the Google Drive section) to read the file"); return; }
-  setStatus("Downloading settings from Google Driveâ€¦");
+  setStatus("Downloading settings from Google Drive\u2026");
   let text;
   try {
     text = await fetchTextFile(fileId, key);
